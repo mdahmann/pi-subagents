@@ -11,6 +11,31 @@ interface ChainStepResult {
 	success: boolean;
 }
 
+function sanitizeForNotify(text: string, opts?: { maxLines?: number; maxLineChars?: number }): string {
+	const maxLines = opts?.maxLines ?? 80;
+	const maxLineChars = opts?.maxLineChars ?? 160;
+
+	const withoutOsc = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+	const withoutAnsi = withoutOsc
+		.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/\x1b[@-_]/g, "");
+	const withoutControls = withoutAnsi.replace(/[\u0000-\u0008\u000B-\u001A\u001C-\u001F\u007F]/g, "");
+
+	const lines = withoutControls
+		.split("\n")
+		.map((line) => line.trimEnd());
+
+	const clamped = lines.slice(0, maxLines).map((line) =>
+		line.length > maxLineChars ? `${line.slice(0, Math.max(1, maxLineChars - 1))}…` : line,
+	);
+
+	if (lines.length > maxLines) {
+		clamped.push(`… (${lines.length - maxLines} more lines)`);
+	}
+
+	return clamped.join("\n");
+}
+
 interface SubagentResult {
 	id: string | null;
 	agent: string | null;
@@ -54,10 +79,11 @@ export default function registerSubagentNotify(pi: ExtensionAPI): void {
 			extra.push(`Session file: ${result.sessionFile}`);
 		}
 
+		const safeSummary = sanitizeForNotify(result.summary, { maxLines: 80, maxLineChars: 160 });
 		const content = [
 			`Background task ${status}: **${agent}**${taskInfo}`,
 			"",
-			result.summary,
+			safeSummary,
 			extra.length ? "" : undefined,
 			extra.length ? extra.join("\n") : undefined,
 		]

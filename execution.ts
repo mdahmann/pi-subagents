@@ -87,11 +87,12 @@ export async function runSync(
 	if (modelArg) args.push("--models", modelArg);
 	const toolExtensionPaths: string[] = [];
 	if (agent.tools?.length) {
+		const KNOWN_BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 		const builtinTools: string[] = [];
 		for (const tool of agent.tools) {
 			if (tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")) {
 				toolExtensionPaths.push(tool);
-			} else {
+			} else if (KNOWN_BUILTIN_TOOLS.has(tool)) {
 				builtinTools.push(tool);
 			}
 		}
