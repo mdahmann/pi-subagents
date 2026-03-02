@@ -150,29 +150,30 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 
 		const stepsTotal = job.stepsTotal ?? (job.agents?.length ?? 1);
 		const stepIndex = job.currentStep !== undefined ? job.currentStep + 1 : undefined;
-		const stepText = stepIndex !== undefined ? `step ${stepIndex}/${stepsTotal}` : `steps ${stepsTotal}`;
+		// Only show step info if there are multiple steps
+		const stepText = stepsTotal > 1
+			? (stepIndex !== undefined ? ` | step ${stepIndex}/${stepsTotal}` : ` | steps ${stepsTotal}`)
+			: "";
 		const endTime = (job.status === "complete" || job.status === "failed") ? (job.updatedAt ?? Date.now()) : Date.now();
 		const elapsed = job.startedAt ? formatDuration(endTime - job.startedAt) : "";
-		const agentLabel = job.agents ? job.agents.join(" -> ") : (job.mode ?? "single");
+		const agentLabel = job.agents ? job.agents.join(" → ") : (job.mode ?? "single");
 
-		const tokenText = job.totalTokens ? ` | ${formatTokens(job.totalTokens.total)} tok` : "";
 		const activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
 		const activitySuffix = activityText ? ` | ${theme.fg("dim", activityText)}` : "";
 
-		lines.push(truncLine(`- ${id} ${status} | ${agentLabel} | ${stepText}${elapsed ? ` | ${elapsed}` : ""}${tokenText}${activitySuffix}`, w));
+		lines.push(truncLine(`- ${id} ${status} | ${agentLabel}${stepText}${elapsed ? ` | ${elapsed}` : ""}${activitySuffix}`, w));
 
 		if (job.status === "running") {
-			// Show current tool from heartbeat (set by poller), or fall back to output tail
+			// Show current tool from heartbeat only — no output tail fallback (too noisy)
 			let preview = "";
 			if (job.currentTool) {
 				const args = job.currentToolArgs ? `(${job.currentToolArgs})` : "";
 				preview = `→ ${job.currentTool}${args}`;
-			} else if (job.outputFile) {
-				const tail = getOutputTail(job.outputFile, 1);
-				if (tail.length > 0) preview = tail[tail.length - 1];
 			}
 			if (preview) {
-				lines.push(truncLine(theme.fg("dim", `  > ${preview}`), w));
+				// Hard cap preview to half terminal width — never wrap to second line
+				const maxPreview = Math.min(Math.floor(w * 0.6), 60);
+				lines.push(truncLine(theme.fg("dim", `  > ${preview}`), maxPreview));
 			}
 		}
 	}
