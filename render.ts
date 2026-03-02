@@ -148,34 +148,15 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 					? theme.fg("error", "failed")
 					: theme.fg("warning", "running");
 
-		const stepsTotal = job.stepsTotal ?? (job.agents?.length ?? 1);
-		const stepIndex = job.currentStep !== undefined ? job.currentStep + 1 : undefined;
-		// Only show step info if there are multiple steps
-		const stepText = stepsTotal > 1
-			? (stepIndex !== undefined ? ` | step ${stepIndex}/${stepsTotal}` : ` | steps ${stepsTotal}`)
-			: "";
 		const endTime = (job.status === "complete" || job.status === "failed") ? (job.updatedAt ?? Date.now()) : Date.now();
 		const elapsed = job.startedAt ? formatDuration(endTime - job.startedAt) : "";
 		const agentLabel = job.agents ? job.agents.join(" → ") : (job.mode ?? "single");
 
+		// "active Xs ago" from heartbeat/output file mtime
 		const activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
-		const activitySuffix = activityText ? ` | ${theme.fg("dim", activityText)}` : "";
+		const activitySuffix = activityText ? ` | ${activityText}` : "";
 
-		lines.push(truncLine(`- ${id} ${status} | ${agentLabel}${stepText}${elapsed ? ` | ${elapsed}` : ""}${activitySuffix}`, w));
-
-		if (job.status === "running") {
-			// Show current tool from heartbeat only — no output tail fallback (too noisy)
-			let preview = "";
-			if (job.currentTool) {
-				const args = job.currentToolArgs ? `(${job.currentToolArgs})` : "";
-				preview = `→ ${job.currentTool}${args}`;
-			}
-			if (preview) {
-				// Hard cap preview to half terminal width — never wrap to second line
-				const maxPreview = Math.min(Math.floor(w * 0.6), 60);
-				lines.push(truncLine(theme.fg("dim", `  > ${preview}`), maxPreview));
-			}
-		}
+		lines.push(truncLine(`- ${id} ${status} | ${agentLabel}${elapsed ? ` | ${elapsed}` : ""}${activitySuffix}`, w));
 	}
 
 	ctx.ui.setWidget(WIDGET_KEY, lines);
