@@ -17,7 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { Text, matchesKey, Key, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Text, matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsAll } from "./agents.js";
 import { resolveExecutionAgentScope } from "./agent-scope.js";
 import { cleanupOldChainDirs, getStepAgents, isParallelStep, resolveStepBehavior, type ChainStep, type SequentialStep } from "./settings.js";
@@ -138,7 +138,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					job.sessionDir = status.sessionDir ?? job.sessionDir;
 					job.outputFile = status.outputFile ?? job.outputFile;
 					job.totalTokens = status.totalTokens ?? job.totalTokens;
-					// For running jobs, pull live metrics from the active step
+					// Pull live metrics from steps
 					if (status.steps?.length) {
 						const activeStep = status.steps[status.currentStep ?? 0] as Record<string, unknown>;
 						if (!job.totalTokens) {
@@ -149,6 +149,19 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						}
 						job.currentTool = activeStep?.currentTool as string | undefined;
 						job.currentToolArgs = activeStep?.currentToolArgs as string | undefined;
+
+						// Model + cost + tool count from all steps
+						const models: string[] = [];
+						let totalCost = 0;
+						let totalTools = 0;
+						for (const s of status.steps as Record<string, unknown>[]) {
+							models.push((s.resolvedModel ?? s.model ?? "") as string);
+							if (typeof s.liveCost === "number") totalCost += s.liveCost;
+							if (typeof s.toolCount === "number") totalTools += s.toolCount;
+						}
+						job.stepModels = models;
+						if (totalCost > 0) job.liveCost = totalCost;
+						if (totalTools > 0) job.toolCount = totalTools;
 					}
 					job.sessionFile = status.sessionFile ?? job.sessionFile;
 					// job.shareUrl = status.shareUrl ?? job.shareUrl;
@@ -1367,44 +1380,83 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		description: "Show all async subagent runs (scrollable overlay)",
 		handler: async (_args, ctx) => {
 			const jobs = Array.from(asyncJobs.values());
-			if (jobs.length === 0) {
-				ctx.ui.notify("No async subagent runs", "info");
-				return;
-			}
 
 			// Also scan disk for any runs not in memory
 			try {
+				const existingIds = new Set(jobs.map(j => j.asyncId));
 				const dirs = fs.readdirSync(ASYNC_DIR).filter(d => {
 					try { return fs.statSync(path.join(ASYNC_DIR, d)).isDirectory(); } catch { return false; }
 				});
 				for (const dir of dirs) {
-					const existingIds = new Set(jobs.map(j => j.asyncId));
-					if (!existingIds.has(dir)) {
-						const status = readStatus(path.join(ASYNC_DIR, dir));
-						if (status) {
-							jobs.push({
-								asyncId: dir.slice(0, 36),
-								asyncDir: path.join(ASYNC_DIR, dir),
-								status: status.state ?? "unknown",
-								mode: status.mode ?? "single",
-								agents: status.steps?.map((s: { agent: string }) => s.agent),
-								stepsTotal: status.steps?.length,
-								startedAt: status.startedAt,
-								updatedAt: status.lastUpdate,
-								outputFile: status.outputFile,
-							});
+					if (existingIds.has(dir)) continue;
+					const dirPath = path.join(ASYNC_DIR, dir);
+					const status = readStatus(dirPath);
+					if (status) {
+						const stepModels = status.steps?.map((s: Record<string, unknown>) =>
+							((s.resolvedModel ?? s.model ?? "") as string)
+						);
+						let liveCost = 0, toolCount = 0;
+						for (const s of (status.steps ?? []) as Record<string, unknown>[]) {
+							if (typeof s.liveCost === "number") liveCost += s.liveCost;
+							if (typeof s.toolCount === "number") toolCount += s.toolCount;
 						}
+						jobs.push({
+							asyncId: dir.slice(0, 36),
+							asyncDir: dirPath,
+							status: status.state ?? "failed",
+							mode: status.mode ?? "single",
+							agents: status.steps?.map((s: { agent: string }) => s.agent),
+							stepsTotal: status.steps?.length,
+							startedAt: status.startedAt,
+							updatedAt: status.lastUpdate,
+							outputFile: status.outputFile,
+							stepModels,
+							liveCost: liveCost > 0 ? liveCost : undefined,
+							toolCount: toolCount > 0 ? toolCount : undefined,
+						});
 					}
 				}
 			} catch {}
 
+			if (jobs.length === 0) {
+				ctx.ui.notify("No async subagent runs found", "info");
+				return;
+			}
+
 			// Sort: running first, then by start time desc
 			jobs.sort((a, b) => {
-				const aRunning = a.status === "running" || a.status === "queued" ? 0 : 1;
-				const bRunning = b.status === "running" || b.status === "queued" ? 0 : 1;
-				if (aRunning !== bRunning) return aRunning - bRunning;
+				const rank = (s: string) => s === "running" ? 0 : s === "queued" ? 1 : s === "failed" ? 2 : 3;
+				const r = rank(a.status) - rank(b.status);
+				if (r !== 0) return r;
 				return (b.startedAt ?? 0) - (a.startedAt ?? 0);
 			});
+
+			// Helper: format elapsed time
+			const fmtElapsed = (startMs: number, endMs: number): string => {
+				const s = Math.floor((endMs - startMs) / 1000);
+				if (s >= 3600) return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+				if (s >= 60) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+				return `${s}s`;
+			};
+
+			// Helper: short model name  "google-antigravity/gemini-3.1-pro-high:high" → "gemini-3.1-pro-high"
+			const shortModel = (m: string): string => {
+				if (!m) return "";
+				// Strip provider prefix
+				const slashIdx = m.indexOf("/");
+				let name = slashIdx >= 0 ? m.slice(slashIdx + 1) : m;
+				// Strip :mode suffix
+				const colonIdx = name.indexOf(":");
+				if (colonIdx >= 0) name = name.slice(0, colonIdx);
+				return name;
+			};
+
+			// Helper: format cost
+			const fmtCost = (c: number): string => {
+				if (c >= 1) return `$${c.toFixed(2)}`;
+				if (c >= 0.01) return `$${c.toFixed(2)}`;
+				return `$${c.toFixed(3)}`;
+			};
 
 			await ctx.ui.custom((tui, theme, _kb, done) => {
 				let scrollOffset = 0;
@@ -1418,11 +1470,11 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						} else if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
 							if (scrollOffset > 0) { scrollOffset--; cachedWidth = undefined; tui.requestRender(); }
 						} else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
-							scrollOffset++; cachedWidth = undefined; tui.requestRender();
-						} else if (matchesKey(data, Key.home)) {
+							if (scrollOffset < jobs.length - 1) { scrollOffset++; cachedWidth = undefined; tui.requestRender(); }
+						} else if (matchesKey(data, Key.home) || matchesKey(data, "g")) {
 							scrollOffset = 0; cachedWidth = undefined; tui.requestRender();
-						} else if (matchesKey(data, Key.end)) {
-							scrollOffset = Math.max(0, jobs.length - 5); cachedWidth = undefined; tui.requestRender();
+						} else if (matchesKey(data, Key.end) || matchesKey(data, "G")) {
+							scrollOffset = Math.max(0, jobs.length - 1); cachedWidth = undefined; tui.requestRender();
 						}
 					},
 					render(width: number): string[] {
@@ -1430,49 +1482,111 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 
 						const lines: string[] = [];
 						const now = Date.now();
+						const w = Math.min(width, 100);
+						const sep = theme.fg("dim", "─".repeat(w));
 
-						lines.push(theme.fg("accent", `Async Subagents (${jobs.length} runs)`) + theme.fg("dim", "  ↑↓/jk scroll  q/esc close"));
-						lines.push(theme.fg("dim", "─".repeat(Math.min(width, 80))));
+						// ── Header ──
+						const runningCount = jobs.filter(j => j.status === "running").length;
+						const doneCount = jobs.filter(j => j.status === "complete").length;
+						const failCount = jobs.filter(j => j.status === "failed").length;
+						const headerParts = [theme.fg("accent", ` Async Subagents`)];
+						if (runningCount) headerParts.push(theme.fg("warning", `${runningCount} running`));
+						if (doneCount) headerParts.push(theme.fg("success", `${doneCount} done`));
+						if (failCount) headerParts.push(theme.fg("error", `${failCount} failed`));
+						lines.push(headerParts.join(theme.fg("dim", "  ·  ")));
+						lines.push(theme.fg("dim", " ↑↓ scroll  g/G top/bottom  q close"));
+						lines.push(sep);
 
-						const maxVisible = Math.max(5, Math.floor((tui.height ?? 24) * 0.7) - 4);
-						const visible = jobs.slice(scrollOffset, scrollOffset + maxVisible);
+						// ── Compute visible range (each job = 2 lines) ──
+						const termHeight = process.stdout.rows ?? 24;
+						const maxVisibleLines = Math.max(6, Math.floor(termHeight * 0.75) - 5);
+						const maxJobs = Math.floor(maxVisibleLines / 2);
+						const clampedOffset = Math.min(scrollOffset, Math.max(0, jobs.length - maxJobs));
+						const visible = jobs.slice(clampedOffset, clampedOffset + maxJobs);
 
-						for (const job of visible) {
-							const id = job.asyncId.slice(0, 6);
-							const statusText =
-								job.status === "complete" ? theme.fg("success", "✓ complete")
-								: job.status === "failed" ? theme.fg("error", "✗ failed")
-								: job.status === "running" ? theme.fg("warning", "● running")
-								: theme.fg("dim", "○ " + (job.status ?? "unknown"));
+						for (let i = 0; i < visible.length; i++) {
+							const job = visible[i];
+							const id = job.asyncId.slice(0, 8);
 
-							const agentLabel = job.agents?.join(" → ") ?? (job.mode ?? "?");
-							let elapsed = "";
-							if (job.startedAt) {
-								const ms = (job.status === "complete" || job.status === "failed" ? (job.updatedAt ?? now) : now) - job.startedAt;
-								const s = Math.floor(ms / 1000);
-								if (s >= 3600) elapsed = `${Math.floor(s/3600)}h${Math.floor((s%3600)/60)}m`;
-								else if (s >= 60) elapsed = `${Math.floor(s/60)}m${s%60}s`;
-								else elapsed = `${s}s`;
+							// Status icon + label
+							const statusIcon =
+								job.status === "complete" ? theme.fg("success", "✓")
+								: job.status === "failed" ? theme.fg("error", "✗")
+								: job.status === "running" ? theme.fg("warning", "●")
+								: theme.fg("dim", "○");
+
+							// Elapsed
+							const end = (job.status === "complete" || job.status === "failed")
+								? (job.updatedAt ?? now) : now;
+							const elapsed = job.startedAt ? fmtElapsed(job.startedAt, end) : "—";
+
+							// Agent(s)
+							const agentLabel = job.agents?.length
+								? job.agents.join(theme.fg("dim", " → "))
+								: (job.mode ?? "?");
+
+							// ── Line 1: status  agent(s)  elapsed ──
+							const line1 = ` ${statusIcon} ${theme.fg("dim", id)}  ${agentLabel}  ${theme.fg("muted", elapsed)}`;
+							lines.push(truncateToWidth(line1, width));
+
+							// ── Line 2: model · cost · tools · activity ──
+							const detail: string[] = [];
+
+							// Model(s) — show unique non-empty, shortened
+							const models = [...new Set((job.stepModels ?? []).map(shortModel).filter(Boolean))];
+							if (models.length > 0) {
+								detail.push(theme.fg("accent", models.join(theme.fg("dim", ", "))));
 							}
 
-							const activity = (job.status === "running" && job.outputFile) ? getLastActivity(job.outputFile) : "";
-							const activitySuffix = activity && activity !== "DEAD" ? theme.fg("dim", ` | ${activity}`) : "";
-							if (activity === "DEAD") {
-								job.status = "failed";
+							// Cost
+							if (job.liveCost && job.liveCost > 0) {
+								detail.push(theme.fg("muted", fmtCost(job.liveCost)));
 							}
 
-							const line = `  ${theme.fg("dim", id)} ${statusText} ${theme.fg("muted", "|")} ${agentLabel} ${theme.fg("muted", "|")} ${elapsed}${activitySuffix}`;
-							lines.push(truncateToWidth(line, width));
+							// Tool calls
+							if (job.toolCount && job.toolCount > 0) {
+								detail.push(theme.fg("dim", `${job.toolCount} calls`));
+							}
+
+							// Current activity (running only)
+							if (job.status === "running" && job.currentTool) {
+								const toolLabel = job.currentToolArgs
+									? `${job.currentTool}(${job.currentToolArgs})`
+									: job.currentTool;
+								detail.push(theme.fg("dim", `→ ${toolLabel}`));
+							}
+
+							// Dead process detection
+							if (job.status === "running" && job.outputFile) {
+								const activity = getLastActivity(job.outputFile);
+								if (activity === "DEAD") {
+									job.status = "failed";
+									detail.push(theme.fg("error", "process dead"));
+								}
+							}
+
+							if (detail.length > 0) {
+								lines.push(truncateToWidth(`   ${detail.join(theme.fg("dim", "  ·  "))}`, width));
+							} else {
+								lines.push(theme.fg("dim", "   —"));
+							}
+
+							// Separator between jobs (except last)
+							if (i < visible.length - 1) {
+								lines.push(theme.fg("dim", "   " + "·".repeat(Math.min(w - 6, 40))));
+							}
 						}
 
-						if (scrollOffset > 0) {
-							lines.push(theme.fg("dim", `  ↑ ${scrollOffset} more above`));
+						// ── Scroll indicators ──
+						if (clampedOffset > 0) {
+							lines.push(theme.fg("dim", `   ↑ ${clampedOffset} more`));
 						}
-						if (scrollOffset + maxVisible < jobs.length) {
-							lines.push(theme.fg("dim", `  ↓ ${jobs.length - scrollOffset - maxVisible} more below`));
+						const remaining = jobs.length - clampedOffset - maxJobs;
+						if (remaining > 0) {
+							lines.push(theme.fg("dim", `   ↓ ${remaining} more`));
 						}
 
-						lines.push(theme.fg("dim", "─".repeat(Math.min(width, 80))));
+						lines.push(sep);
 
 						cachedWidth = width;
 						cachedLines = lines;
@@ -1480,7 +1594,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					},
 					invalidate() { cachedWidth = undefined; cachedLines = undefined; },
 				};
-			}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "80%" } });
+			}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "85%" } });
 		},
 	});
 

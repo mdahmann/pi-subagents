@@ -178,6 +178,12 @@ export interface AsyncJobState {
 	currentTool?: string;
 	/** Abbreviated args for current tool */
 	currentToolArgs?: string;
+	/** Model(s) per step from status.json — resolvedModel or model field */
+	stepModels?: string[];
+	/** Live cost from status.json steps */
+	liveCost?: number;
+	/** Tool call count from status.json steps */
+	toolCount?: number;
 }
 
 // ============================================================================
