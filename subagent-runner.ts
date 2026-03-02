@@ -124,14 +124,12 @@ function runPiStreaming(
 		const spawnEnv = { ...process.env, ...(env ?? {}), ...getSubagentDepthEnv() };
 		const spawnSpec = getPiSpawnCommand(args, piPackageRoot ? { piPackageRoot } : undefined);
 		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
-		let stdout = "";
 		let lineBuf = "";
 
 		if (child.pid && onPid) onPid(child.pid);
 
 		child.stdout.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
-			stdout += text;
 			outputStream.write(text);
 
 			// Parse JSONL events for tool activity tracking
@@ -175,12 +173,12 @@ function runPiStreaming(
 
 		child.on("close", (exitCode) => {
 			outputStream.end();
-			resolve({ stdout, exitCode });
+			resolve({ stdout: outputFile, exitCode });
 		});
 
 		child.on("error", () => {
 			outputStream.end();
-			resolve({ stdout, exitCode: 1 });
+			resolve({ stdout: outputFile, exitCode: 1 });
 		});
 	});
 }
@@ -469,28 +467,46 @@ async function runSingleStep(
 		try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
 	}
 
-	// Extract final assistant text from JSONL events (--mode json output)
-	// Event format matches pi --mode json: message_end events with .message.content[]
+	// Extract final assistant text from JSONL output file
+	// Streams line-by-line to avoid loading 500MB+ files into memory
+	// (thinking:high models can produce huge message_update deltas)
 	let output = "";
-	const rawStdout = (result.stdout || "").trim();
-	for (const line of rawStdout.split("\n")) {
-		if (!line.startsWith("{")) continue;
-		try {
-			const evt = JSON.parse(line);
-			if (evt.type === "message_end" && evt.message?.role === "assistant") {
-				const content = evt.message.content;
-				if (Array.isArray(content)) {
-					for (const part of content) {
-						if (part.type === "text" && part.text) output = part.text;
+	try {
+		const rl = require("readline").createInterface({
+			input: fs.createReadStream(ctx.outputFile, { encoding: "utf-8" }),
+			crlfDelay: Infinity,
+		});
+		for await (const line of rl) {
+			if (!line.startsWith("{")) continue;
+			// Skip message_update lines (can be 800KB+ with thinking deltas)
+			if (line.includes('"message_update"')) continue;
+			try {
+				const evt = JSON.parse(line);
+				if (evt.type === "message_end" && evt.message?.role === "assistant") {
+					const content = evt.message.content;
+					if (Array.isArray(content)) {
+						for (const part of content) {
+							if (part.type === "text" && part.text) output = part.text;
+						}
+					} else if (typeof content === "string") {
+						output = content;
 					}
-				} else if (typeof content === "string") {
-					output = content;
 				}
-			}
+			} catch {}
+		}
+	} catch {}
+	// Fallback: if no structured output found, read last 10KB of file
+	if (!output) {
+		try {
+			const stat = fs.statSync(ctx.outputFile);
+			const start = Math.max(0, stat.size - 10240);
+			const buf = Buffer.alloc(Math.min(stat.size, 10240));
+			const fd = fs.openSync(ctx.outputFile, "r");
+			fs.readSync(fd, buf, 0, buf.length, start);
+			fs.closeSync(fd);
+			output = buf.toString("utf-8");
 		} catch {}
 	}
-	// Fallback: if no structured output found, use raw stdout (plain text mode compat)
-	if (!output) output = rawStdout;
 	let outputForSummary = output;
 	if (step.outputPath && result.exitCode === 0) {
 		const persisted = persistSingleOutput(step.outputPath, output);
