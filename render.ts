@@ -141,6 +141,17 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 
 	for (const job of displayedJobs) {
 		const id = job.asyncId.slice(0, 6);
+		const agentLabel = job.agents ? job.agents.join(" → ") : (job.mode ?? "single");
+
+		// "active Xs ago" from heartbeat/output file mtime
+		// Also detects dead processes and auto-updates status.json
+		let activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
+		// If getLastActivity detected a dead process, update the job status for display
+		if (activityText === "DEAD") {
+			activityText = "";
+			job.status = "failed";
+		}
+
 		const status =
 			job.status === "complete"
 				? theme.fg("success", "complete")
@@ -150,10 +161,6 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 
 		const endTime = (job.status === "complete" || job.status === "failed") ? (job.updatedAt ?? Date.now()) : Date.now();
 		const elapsed = job.startedAt ? formatDuration(endTime - job.startedAt) : "";
-		const agentLabel = job.agents ? job.agents.join(" → ") : (job.mode ?? "single");
-
-		// "active Xs ago" from heartbeat/output file mtime
-		const activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
 		const activitySuffix = activityText ? ` | ${activityText}` : "";
 
 		lines.push(truncLine(`- ${id} ${status} | ${agentLabel}${elapsed ? ` | ${elapsed}` : ""}${activitySuffix}`, w));

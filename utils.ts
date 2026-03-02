@@ -3,6 +3,7 @@
  */
 
 import * as fs from "node:fs";
+import * as path from "node:path";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
@@ -156,7 +157,32 @@ export function getLastActivity(outputFile: string | undefined): string {
 		const ago = Date.now() - stat.mtimeMs;
 		if (ago < 1000) return "active now";
 		if (ago < 60000) return `active ${Math.floor(ago / 1000)}s ago`;
-		return `active ${Math.floor(ago / 60000)}m ago`;
+
+		const minAgo = Math.floor(ago / 60000);
+
+		// If stale for 5+ min, check if process is actually alive
+		if (minAgo >= 5) {
+			try {
+				const statusPath = path.join(path.dirname(outputFile), "status.json");
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+				const pid = status.pid;
+				if (pid) {
+					try {
+						process.kill(pid, 0); // signal 0 = check existence
+					} catch {
+						// Process is dead — update status.json
+						status.state = "failed";
+						status.endedAt = Date.now();
+						status.lastUpdate = Date.now();
+						status.error = `Process ${pid} died without completion (stale ${minAgo}m)`;
+						fs.writeFileSync(statusPath, JSON.stringify(status, null, 2));
+						return "DEAD";
+					}
+				}
+			} catch {}
+		}
+
+		return `active ${minAgo}m ago`;
 	} catch {
 		return "";
 	}

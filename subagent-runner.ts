@@ -542,6 +542,13 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const logPath = path.join(asyncDir, `subagent-log-${id}.md`);
 	let previousCumulativeTokens: TokenUsage = { input: 0, output: 0, total: 0 };
 
+	// Register paths for crash handlers
+	_activeAsyncDir = asyncDir;
+	_activeEventsPath = eventsPath;
+	_activeStatusPath = statusPath;
+	_activeRunId = id;
+	_activeStartedAt = overallStartTime;
+
 	// Flatten steps for status tracking (parallel groups expand to individual entries)
 	const flatSteps = flattenSteps(steps);
 	const statusPayload: {
@@ -944,6 +951,68 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	}
 }
 
+// --- Crash / signal handlers ---
+// If the runner dies unexpectedly, mark status as failed so the widget
+// doesn't show "running" forever and notifications can fire.
+let _activeAsyncDir: string | undefined;
+let _activeEventsPath: string | undefined;
+let _activeStatusPath: string | undefined;
+let _activeRunId: string | undefined;
+let _activeStartedAt: number | undefined;
+
+function writeCrashStatus(reason: string): void {
+	const now = Date.now();
+	if (_activeStatusPath) {
+		try {
+			const existing = JSON.parse(fs.readFileSync(_activeStatusPath, "utf-8"));
+			existing.state = "failed";
+			existing.endedAt = now;
+			existing.lastUpdate = now;
+			existing.error = reason;
+			fs.writeFileSync(_activeStatusPath, JSON.stringify(existing, null, 2));
+		} catch {
+			// status.json may not exist yet
+			try {
+				fs.writeFileSync(_activeStatusPath, JSON.stringify({
+					runId: _activeRunId ?? "unknown",
+					state: "failed",
+					endedAt: now,
+					lastUpdate: now,
+					error: reason,
+				}));
+			} catch {}
+		}
+	}
+	if (_activeEventsPath) {
+		try {
+			appendJsonl(_activeEventsPath, JSON.stringify({
+				type: "subagent.run.crashed",
+				ts: now,
+				runId: _activeRunId ?? "unknown",
+				reason,
+				durationMs: _activeStartedAt ? now - _activeStartedAt : undefined,
+			}));
+		} catch {}
+	}
+}
+
+for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+	process.on(sig, () => {
+		writeCrashStatus(`Process killed by ${sig}`);
+		process.exit(128);
+	});
+}
+process.on("uncaughtException", (err) => {
+	writeCrashStatus(`Uncaught exception: ${err?.message ?? String(err)}`);
+	console.error("Subagent runner uncaught exception:", err);
+	process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+	writeCrashStatus(`Unhandled rejection: ${reason instanceof Error ? reason.message : String(reason)}`);
+	console.error("Subagent runner unhandled rejection:", reason);
+	process.exit(1);
+});
+
 const configArg = process.argv[2];
 if (configArg) {
 	try {
@@ -953,6 +1022,7 @@ if (configArg) {
 			fs.unlinkSync(configArg);
 		} catch {}
 		runSubagent(config).catch((runErr) => {
+			writeCrashStatus(`runSubagent error: ${runErr?.message ?? String(runErr)}`);
 			console.error("Subagent runner error:", runErr);
 			process.exit(1);
 		});
@@ -970,6 +1040,7 @@ if (configArg) {
 		try {
 			const config = JSON.parse(input) as SubagentRunConfig;
 			runSubagent(config).catch((runErr) => {
+				writeCrashStatus(`runSubagent error: ${runErr?.message ?? String(runErr)}`);
 				console.error("Subagent runner error:", runErr);
 				process.exit(1);
 			});
