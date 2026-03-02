@@ -541,6 +541,12 @@ async function runSingleStep(
 		}
 	}
 
+	// Delete the output log file — it can be 500MB+ with --mode json thinking deltas.
+	// The useful content has been extracted to `output` and saved to artifacts above.
+	try {
+		if (fs.existsSync(ctx.outputFile)) fs.unlinkSync(ctx.outputFile);
+	} catch {}
+
 	return { agent: step.agent, output: outputForSummary, exitCode: result.exitCode, artifactPaths };
 }
 

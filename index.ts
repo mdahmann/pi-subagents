@@ -89,12 +89,73 @@ function ensureAccessibleDir(dirPath: string): void {
 	}
 }
 
+/** Delete async run directories older than maxAgeMs. These contain output-*.log files
+ *  that can be 500MB+ each when using --mode json with thinking models. */
+function cleanupOldAsyncDirs(dir: string, maxAgeMs: number): void {
+	if (!fs.existsSync(dir)) return;
+	const now = Date.now();
+	let entries: string[];
+	try { entries = fs.readdirSync(dir); } catch { return; }
+	for (const entry of entries) {
+		try {
+			const entryPath = path.join(dir, entry);
+			const stat = fs.statSync(entryPath);
+			if (stat.isDirectory() && now - stat.mtimeMs > maxAgeMs) {
+				fs.rmSync(entryPath, { recursive: true, force: true });
+			}
+		} catch {}
+	}
+}
+
+/** Delete individual files older than maxAgeMs from a flat directory. */
+function cleanupOldFiles(dir: string, maxAgeMs: number): void {
+	if (!fs.existsSync(dir)) return;
+	const now = Date.now();
+	let entries: string[];
+	try { entries = fs.readdirSync(dir); } catch { return; }
+	for (const entry of entries) {
+		try {
+			const entryPath = path.join(dir, entry);
+			const stat = fs.statSync(entryPath);
+			if (stat.isFile() && now - stat.mtimeMs > maxAgeMs) {
+				fs.unlinkSync(entryPath);
+			}
+		} catch {}
+	}
+}
+
+/** Clean up orphaned /tmp/pi-subagent-XXXXXX dirs (prompt files from crashed processes). */
+function cleanupOrphanedSubagentDirs(maxAgeMs: number): void {
+	const tmpdir = os.tmpdir();
+	let entries: string[];
+	try { entries = fs.readdirSync(tmpdir); } catch { return; }
+	const now = Date.now();
+	for (const entry of entries) {
+		if (!entry.startsWith("pi-subagent-") || entry.startsWith("pi-subagent-artifacts") || entry.startsWith("pi-subagent-session")) continue;
+		try {
+			const entryPath = path.join(tmpdir, entry);
+			const stat = fs.statSync(entryPath);
+			if (stat.isDirectory() && now - stat.mtimeMs > maxAgeMs) {
+				fs.rmSync(entryPath, { recursive: true, force: true });
+			}
+		} catch {}
+	}
+}
+
 export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	ensureAccessibleDir(RESULTS_DIR);
 	ensureAccessibleDir(ASYNC_DIR);
 
 	// Cleanup old chain directories on startup (after 24h)
 	cleanupOldChainDirs();
+
+	// Cleanup old async run directories on startup (after 24h)
+	// These contain output-*.log files that can be 500MB+ each (--mode json thinking deltas)
+	cleanupOldAsyncDirs(ASYNC_DIR, 24 * 60 * 60 * 1000);
+	// Cleanup old result files (after 7 days)
+	cleanupOldFiles(RESULTS_DIR, 7 * 24 * 60 * 60 * 1000);
+	// Cleanup orphaned ephemeral prompt dirs (after 24h)
+	cleanupOrphanedSubagentDirs(24 * 60 * 60 * 1000);
 
 	const config = loadConfig();
 	const asyncByDefault = config.asyncByDefault === true;
