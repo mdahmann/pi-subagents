@@ -1802,9 +1802,9 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 									if (models.length) parts.push(theme.fg("accent", models.join(theme.fg("dim", ", "))));
 									if (job.liveCost) parts.push(theme.fg("muted", fmtCost(job.liveCost)));
 									if (job.toolCount) parts.push(theme.fg("dim", `${job.toolCount} calls`));
-									if (job.status === "running" && job.currentTool) {
-										const tl = job.currentToolArgs ? `${job.currentTool}(${job.currentToolArgs})` : job.currentTool;
-										parts.push(theme.fg("dim", `→ ${tl}`));
+									if (job.status === "running") {
+										const activity = getLastActivity(job.outputFile);
+										if (activity && activity !== "DEAD") parts.push(theme.fg("muted", activity));
 									}
 									lines.push(truncateToWidth(`${pad}     ${parts.length ? parts.join(theme.fg("dim", "  ·  ")) : theme.fg("dim", "—")}`, width));
 
