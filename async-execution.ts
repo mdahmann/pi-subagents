@@ -77,6 +77,7 @@ export interface AsyncSingleParams {
 	sessionRoot?: string;
 	skills?: string[];
 	output?: string | false;
+	modelOverride?: string;
 }
 
 export interface AsyncExecutionResult {
@@ -275,6 +276,7 @@ export function executeAsyncSingle(
 	const runnerCwd = cwd ?? ctx.cwd;
 	const outputPath = resolveSingleOutputPath(params.output, ctx.cwd, cwd);
 	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
+	const effectiveModel = params.modelOverride ?? agentConfig.model;
 	const pid = spawnRunner(
 		{
 			id,
@@ -283,7 +285,7 @@ export function executeAsyncSingle(
 					agent,
 					task: taskWithOutputInstruction,
 					cwd,
-					model: applyThinkingSuffix(agentConfig.model, agentConfig.thinking),
+					model: applyThinkingSuffix(effectiveModel, agentConfig.thinking),
 					tools: agentConfig.tools,
 					extensions: agentConfig.extensions,
 					mcpDirectTools: agentConfig.mcpDirectTools,

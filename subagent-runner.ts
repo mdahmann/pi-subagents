@@ -268,6 +268,9 @@ interface SingleStepContext {
 	flatStepCount: number;
 	outputFile: string;
 	piPackageRoot?: string;
+	/** For heartbeat updates during long-running steps */
+	statusPayload?: Record<string, unknown>;
+	statusPath?: string;
 }
 
 /** Run a single pi agent step, returning output and metadata */
@@ -342,7 +345,24 @@ async function runSingleStep(
 		mcpEnv.MCP_DIRECT_TOOLS = "__none__";
 	}
 
+	// Heartbeat: periodically update status.json with output log size while step runs
+	const heartbeatInterval = setInterval(() => {
+		try {
+			if (ctx.statusPayload && ctx.statusPath) {
+				const logSize = fs.existsSync(ctx.outputFile)
+					? fs.statSync(ctx.outputFile).size
+					: 0;
+				ctx.statusPayload.lastUpdate = Date.now();
+				if (ctx.statusPayload.steps?.[ctx.flatIndex]) {
+					(ctx.statusPayload.steps[ctx.flatIndex] as Record<string, unknown>).outputBytes = logSize;
+				}
+				writeJson(ctx.statusPath, ctx.statusPayload);
+			}
+		} catch {}
+	}, 15_000);
+
 	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, mcpEnv, ctx.piPackageRoot);
+	clearInterval(heartbeatInterval);
 
 	if (tmpDir) {
 		try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
@@ -414,6 +434,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		currentStep: number;
 		steps: Array<{
 			agent: string;
+			model?: string;
 			status: "pending" | "running" | "complete" | "failed";
 			startedAt?: number;
 			endedAt?: number;
@@ -441,7 +462,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		pid: process.pid,
 		cwd,
 		currentStep: 0,
-		steps: flatSteps.map((step) => ({ agent: step.agent, status: "pending", skills: step.skills })),
+		steps: flatSteps.map((step) => ({ agent: step.agent, model: step.model, status: "pending", skills: step.skills })),
 		artifactsDir,
 		sessionDir: config.sessionDir,
 		outputFile: path.join(asyncDir, "output-0.log"),
@@ -523,6 +544,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						flatIndex: fi, flatStepCount: flatSteps.length,
 						outputFile: path.join(asyncDir, `output-${fi}.log`),
 						piPackageRoot: config.piPackageRoot,
+						statusPayload: statusPayload as Record<string, unknown>,
+						statusPath,
 					});
 
 					const taskEndTime = Date.now();
@@ -623,6 +646,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				flatIndex, flatStepCount: flatSteps.length,
 				outputFile: path.join(asyncDir, `output-${flatIndex}.log`),
 				piPackageRoot: config.piPackageRoot,
+				statusPayload: statusPayload as Record<string, unknown>,
+				statusPath,
 			});
 
 			previousOutput = singleResult.output;

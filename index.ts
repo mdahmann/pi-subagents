@@ -440,6 +440,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							return normalized;
 						})(),
 						output: effectiveOutput,
+						modelOverride: params.model as string | undefined,
 					});
 				}
 			}
@@ -776,6 +777,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							sessionRoot,
 							skills: skillOverride === false ? [] : skillOverride,
 							output: effectiveOutput,
+							modelOverride,
 						});
 					}
 				}
@@ -929,18 +931,76 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						current !== undefined ? `Step: ${current}/${stepsTotal}` : `Steps: ${stepsTotal}`;
 					const started = new Date(status.startedAt).toISOString();
 					const updated = status.lastUpdate ? new Date(status.lastUpdate).toISOString() : "n/a";
+					const elapsed = status.endedAt
+						? `${((status.endedAt - status.startedAt) / 1000).toFixed(0)}s`
+						: `${((Date.now() - status.startedAt) / 1000).toFixed(0)}s (running)`;
 
 					const lines = [
 						`Run: ${status.runId}`,
 						`State: ${status.state}`,
 						`Mode: ${status.mode}`,
 						stepLine,
+						`Elapsed: ${elapsed}`,
 						`Started: ${started}`,
 						`Updated: ${updated}`,
 						`Dir: ${asyncDir}`,
 					];
+
+					// Show per-step details (model, status, tokens, errors)
+					if (status.steps?.length) {
+						lines.push("", "Steps:");
+						for (let i = 0; i < status.steps.length; i++) {
+							const s = status.steps[i] as { agent: string; model?: string; status: string; exitCode?: number | null; error?: string; tokens?: { input: number; output: number; total: number }; durationMs?: number; outputBytes?: number };
+							const dur = s.durationMs ? `${(s.durationMs / 1000).toFixed(1)}s` : "";
+							const tok = s.tokens ? `${s.tokens.total} tokens` : "";
+							const modelTag = s.model ? ` [${s.model}]` : "";
+							const outSize = s.outputBytes ? `${(s.outputBytes / 1024).toFixed(0)}KB output` : "";
+							const info = [dur, tok, outSize].filter(Boolean).join(", ");
+							lines.push(`  ${i + 1}. ${s.agent}${modelTag}: ${s.status}${info ? ` (${info})` : ""}`);
+							if (s.error) lines.push(`     ⚠️ ${s.error}`);
+						}
+					}
+
+					// Quick failure triage for failed runs
+					if (status.state === "failed" || status.error) {
+						lines.push("", "--- Failure Triage ---");
+						// Check all output logs (output-0.log, output-1.log, etc.)
+						const outputFiles = fs.readdirSync(asyncDir).filter((f: string) => f.match(/^output-\d+\.log$/)).sort();
+						for (const of2 of outputFiles) {
+							const outputLogPath = path.join(asyncDir, of2);
+							const logSize = fs.statSync(outputLogPath).size;
+							if (logSize === 0) {
+								lines.push(`⚠️ ${of2}: BLANK — likely provider 429/quota/auth error.`);
+							} else {
+								const logContent = fs.readFileSync(outputLogPath, "utf-8");
+								const logLines = logContent.split("\n");
+								// Pattern-match known failures
+								const has429 = logLines.some((l: string) => /429|rate.limit|quota.*exceed|resource.*exhaust/i.test(l));
+								const hasAuth = logLines.some((l: string) => /401|403|auth.*fail|invalid.*key|unauthorized/i.test(l));
+								const hasTimeout = logLines.some((l: string) => /timeout|timed.out|ETIMEDOUT/i.test(l));
+								const hasOOM = logLines.some((l: string) => /heap|memory|ENOMEM|killed/i.test(l));
+								if (has429) lines.push(`⚠️ ${of2}: PROVIDER QUOTA/RATE LIMIT (429) — cool down or switch model.`);
+								else if (hasAuth) lines.push(`⚠️ ${of2}: AUTH ERROR — check API key / credentials.`);
+								else if (hasTimeout) lines.push(`⚠️ ${of2}: TIMEOUT — request took too long.`);
+								else if (hasOOM) lines.push(`⚠️ ${of2}: MEMORY — process killed or OOM.`);
+								// Tail last 8 lines
+								const tail = logLines.slice(-8).join("\n").trim();
+								if (tail) {
+									lines.push(`${of2} tail (${(logSize / 1024).toFixed(0)}KB):`);
+									lines.push(tail);
+								}
+							}
+						}
+						if (outputFiles.length === 0) {
+							lines.push("⚠️ No output logs found — process may not have started.");
+						}
+						if (status.error) lines.push(`Error: ${status.error}`);
+					}
+
+					if (status.totalTokens) {
+						lines.push(`Tokens: ${status.totalTokens.input}in + ${status.totalTokens.output}out = ${status.totalTokens.total} total`);
+					}
 					if (status.sessionFile) lines.push(`Session: ${status.sessionFile}`);
-					// Sharing disabled - session file path shown above
 					if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);
 					if (fs.existsSync(eventsPath)) lines.push(`Events: ${eventsPath}`);
 

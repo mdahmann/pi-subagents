@@ -152,11 +152,12 @@ export interface AsyncStatus {
 	endedAt?: number;
 	lastUpdate?: number;
 	currentStep?: number;
-	steps?: Array<{ agent: string; status: string; durationMs?: number; tokens?: TokenUsage; skills?: string[] }>;
+	steps?: Array<{ agent: string; model?: string; status: string; exitCode?: number | null; error?: string; durationMs?: number; outputBytes?: number; tokens?: TokenUsage; skills?: string[] }>;
 	sessionDir?: string;
 	outputFile?: string;
 	totalTokens?: TokenUsage;
 	sessionFile?: string;
+	error?: string;
 }
 
 export interface AsyncJobState {
