@@ -46,6 +46,60 @@ const outputTailCache = new Map<string, { mtime: number; size: number; lines: st
 /**
  * Get the last N lines from an output file (with mtime/size-based caching)
  */
+/**
+ * Extract human-readable text from JSONL event lines.
+ * Filters out raw JSON, extracts text deltas and tool activity.
+ */
+function extractReadableLines(rawLines: string[]): string[] {
+	const readable: string[] = [];
+	for (let i = rawLines.length - 1; i >= 0 && readable.length < 10; i--) {
+		const line = rawLines[i].trim();
+		if (!line) continue;
+
+		// Plain text lines (warnings, errors) — keep as-is
+		if (!line.startsWith("{")) {
+			readable.unshift(line);
+			continue;
+		}
+
+		// JSONL event — extract meaningful content
+		try {
+			const evt = JSON.parse(line);
+
+			if (evt.type === "tool_execution_start" && evt.toolName) {
+				const argsPreview = evt.args
+					? Object.entries(evt.args as Record<string, unknown>)
+						.slice(0, 2)
+						.map(([k, v]) => `${k}=${typeof v === "string" ? v.slice(0, 20) : v}`)
+						.join(", ")
+					: "";
+				readable.unshift(`→ ${evt.toolName}(${argsPreview})`);
+			} else if (evt.type === "message_update" && evt.assistantMessageEvent) {
+				const ae = evt.assistantMessageEvent;
+				if (ae.type === "text_delta" && ae.delta) {
+					readable.unshift(ae.delta.slice(0, 120));
+				}
+			} else if (evt.type === "message_end" && evt.message?.role === "assistant") {
+				// Extract final text from content array
+				const content = evt.message.content;
+				if (Array.isArray(content)) {
+					for (const part of content) {
+						if (part.type === "text" && part.text) {
+							const preview = part.text.split("\n").filter((l: string) => l.trim()).slice(-2).join(" | ");
+							readable.unshift(preview.slice(0, 120));
+						}
+					}
+				}
+			}
+			// Skip other JSONL event types (session, turn_start, message_start, etc.)
+		} catch {
+			// Not valid JSON — show as-is
+			readable.unshift(line);
+		}
+	}
+	return readable;
+}
+
 export function getOutputTail(outputFile: string | undefined, maxLines: number = 3): string[] {
 	if (!outputFile) return [];
 	let fd: number | null = null;
@@ -59,14 +113,17 @@ export function getOutputTail(outputFile: string | undefined, maxLines: number =
 			return cached.lines;
 		}
 
-		const tailBytes = 4096;
+		const tailBytes = 8192; // Read more to find readable content in JSONL streams
 		const start = Math.max(0, stat.size - tailBytes);
 		fd = fs.openSync(outputFile, "r");
 		const buffer = Buffer.alloc(Math.min(tailBytes, stat.size));
 		fs.readSync(fd, buffer, 0, buffer.length, start);
 		const content = buffer.toString("utf-8");
 		const allLines = content.split("\n").filter((l) => l.trim());
-		const lines = allLines.slice(-maxLines).map((l) => l.slice(0, 120) + (l.length > 120 ? "..." : ""));
+
+		// Extract readable content from JSONL events (or pass through plain text)
+		const readable = extractReadableLines(allLines);
+		const lines = readable.slice(-maxLines).map((l) => l.slice(0, 120) + (l.length > 120 ? "…" : ""));
 
 		// Cache the result
 		outputTailCache.set(outputFile, { mtime: stat.mtimeMs, size: stat.size, lines });
