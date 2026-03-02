@@ -1601,26 +1601,29 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					let scroll = 0;
 					let cW: number | undefined;
 					let cL: string[] | undefined;
+					const dp = "  "; // detail padding
+
+					const inv = () => { cW = undefined; cL = undefined; tui.requestRender(); };
 
 					return {
 						handleInput(data: string) {
 							if (matchesKey(data, Key.escape) || matchesKey(data, "q") || matchesKey(data, Key.backspace)) {
 								done(null);
 							} else if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
-								if (scroll > 0) { scroll--; cW = undefined; tui.requestRender(); }
+								if (scroll > 0) { scroll--; inv(); }
 							} else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
-								if (scroll < allLines.length - 1) { scroll++; cW = undefined; tui.requestRender(); }
+								if (scroll < allLines.length - 1) { scroll++; inv(); }
 							} else if (matchesKey(data, Key.home) || matchesKey(data, "g")) {
-								scroll = 0; cW = undefined; tui.requestRender();
+								scroll = 0; inv();
 							} else if (matchesKey(data, Key.end) || matchesKey(data, "G")) {
-								scroll = Math.max(0, allLines.length - 5); cW = undefined; tui.requestRender();
+								scroll = Math.max(0, allLines.length - 5); inv();
 							}
 						},
 						render(width: number): string[] {
 							if (cL && cW === width) return cL;
 							const now = Date.now();
 							const w = Math.min(width, 100);
-							const sep = theme.fg("dim", "─".repeat(w));
+							const sep = theme.fg("dim", dp + "─".repeat(w - 4));
 							const out: string[] = [];
 
 							// Header
@@ -1634,35 +1637,40 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							const elapsed = job.startedAt ? fmtElapsed(job.startedAt, end) : "—";
 							const models = [...new Set((job.stepModels ?? []).map(shortModel).filter(Boolean))];
 
-							out.push(` ${icon} ${theme.fg("dim", id)}  ${agents}  ${theme.fg("muted", elapsed)}`);
+							out.push("");
+							out.push(`${dp} ${icon} ${theme.fg("dim", id)}  ${agents}  ${theme.fg("muted", elapsed)}`);
 							const meta: string[] = [];
 							if (models.length) meta.push(theme.fg("accent", models.join(", ")));
 							if (job.liveCost) meta.push(fmtCost(job.liveCost));
 							if (job.toolCount) meta.push(`${job.toolCount} calls`);
-							if (meta.length) out.push(theme.fg("muted", `   ${meta.join("  ·  ")}`));
-							out.push(theme.fg("dim", " ↑↓/jk scroll  g/G jump  esc/q back"));
+							if (meta.length) out.push(theme.fg("muted", `${dp}    ${meta.join("  ·  ")}`));
+							out.push("");
 							out.push(sep);
 
 							// Scrollable content
 							const termH = process.stdout.rows ?? 24;
-							const maxVisible = Math.max(5, Math.floor(termH * 0.75) - 6);
+							const maxVisible = Math.max(5, Math.floor(termH * 0.75) - 8);
 							const clamped = Math.min(scroll, Math.max(0, allLines.length - maxVisible));
 							const visible = allLines.slice(clamped, clamped + maxVisible);
 
+							out.push(""); // breathing room
 							for (const line of visible) {
 								let styled = line;
 								if (line.startsWith("🔧")) styled = theme.fg("muted", line);
-								else if (line.startsWith("💬")) styled = line; // keep emoji
+								else if (line.startsWith("💬")) styled = line;
 								else if (line.startsWith("❌")) styled = theme.fg("error", line);
-								else if (line === line.toUpperCase() && line.length > 2 && !line.startsWith("(")) styled = theme.fg("accent", ` ${line}`);
-								else styled = ` ${line}`;
-								out.push(truncateToWidth(styled, width));
+								else if (line === line.toUpperCase() && line.length > 2 && !line.startsWith("(")) styled = theme.fg("accent", line);
+								out.push(truncateToWidth(`${dp}  ${styled}`, width));
 							}
+							out.push("");
 
-							if (clamped > 0) out.push(theme.fg("dim", `   ↑ ${clamped} more`));
+							if (clamped > 0) out.push(theme.fg("dim", `${dp}    ↑ ${clamped} more`));
 							const below = allLines.length - clamped - maxVisible;
-							if (below > 0) out.push(theme.fg("dim", `   ↓ ${below} more`));
+							if (below > 0) out.push(theme.fg("dim", `${dp}    ↓ ${below} more`));
+
 							out.push(sep);
+							out.push(theme.fg("dim", `${dp}↑↓ scroll  g/G jump  esc/q back`));
+							out.push("");
 
 							cW = width;
 							cL = out;
@@ -1673,28 +1681,49 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } });
 			};
 
+			// ── Tab-filtered job lists ──
+			const pad = "  "; // left padding for content
+			const tabDefs = [
+				{ key: "running", label: "Running", icon: "●", filter: (j: AsyncJobState) => j.status === "running" || j.status === "queued" },
+				{ key: "done",    label: "Done",    icon: "✓", filter: (j: AsyncJobState) => j.status === "complete" },
+				{ key: "failed",  label: "Failed",  icon: "✗", filter: (j: AsyncJobState) => j.status === "failed" },
+			] as const;
+			const tabJobs = tabDefs.map(t => displayJobs.filter(t.filter));
+
 			// ── List overlay (returns selected job or null) ──
 			const showList = async (): Promise<AsyncJobState | null> => {
 				return ctx.ui.custom<AsyncJobState | null>((tui, theme, _kb, done) => {
+					let activeTab = tabJobs[0].length > 0 ? 0 : tabJobs[2].length > 0 ? 2 : 1;
 					let cursor = 0;
 					let cachedWidth: number | undefined;
 					let cachedLines: string[] | undefined;
+
+					const inv = () => { cachedWidth = undefined; cachedLines = undefined; tui.requestRender(); };
+					const switchTab = (idx: number) => { activeTab = idx; cursor = 0; inv(); };
+					const currentList = () => tabJobs[activeTab];
 
 					return {
 						handleInput(data: string) {
 							if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
 								done(null);
 							} else if (matchesKey(data, Key.enter)) {
-								if (displayJobs[cursor]) done(displayJobs[cursor]);
+								const list = currentList();
+								if (list[cursor]) done(list[cursor]);
 							} else if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
-								if (cursor > 0) { cursor--; cachedWidth = undefined; tui.requestRender(); }
+								if (cursor > 0) { cursor--; inv(); }
 							} else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
-								if (cursor < displayJobs.length - 1) { cursor++; cachedWidth = undefined; tui.requestRender(); }
+								if (cursor < currentList().length - 1) { cursor++; inv(); }
 							} else if (matchesKey(data, Key.home) || matchesKey(data, "g")) {
-								cursor = 0; cachedWidth = undefined; tui.requestRender();
+								cursor = 0; inv();
 							} else if (matchesKey(data, Key.end) || matchesKey(data, "G")) {
-								cursor = displayJobs.length - 1; cachedWidth = undefined; tui.requestRender();
-							}
+								cursor = Math.max(0, currentList().length - 1); inv();
+							} else if (matchesKey(data, Key.tab) || matchesKey(data, Key.right) || matchesKey(data, "l")) {
+								switchTab((activeTab + 1) % 3);
+							} else if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left) || matchesKey(data, "h")) {
+								switchTab((activeTab + 2) % 3);
+							} else if (data === "1") { switchTab(0); }
+							else if (data === "2") { switchTab(1); }
+							else if (data === "3") { switchTab(2); }
 						},
 						render(width: number): string[] {
 							if (cachedLines && cachedWidth === width) return cachedLines;
@@ -1702,81 +1731,104 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							const lines: string[] = [];
 							const now = Date.now();
 							const w = Math.min(width, 100);
-							const sep = theme.fg("dim", "─".repeat(w));
+							const sep = theme.fg("dim", pad + "─".repeat(w - 4));
 
-							// Header
-							const counts = { running: 0, queued: 0, complete: 0, failed: 0 };
-							for (const j of jobs) counts[j.status] = (counts[j.status] ?? 0) + 1;
-							const hParts = [theme.fg("accent", ` Subagents`)];
-							if (counts.running) hParts.push(theme.fg("warning", `${counts.running} running`));
-							if (counts.queued) hParts.push(theme.fg("dim", `${counts.queued} queued`));
-							if (counts.complete) hParts.push(theme.fg("success", `${counts.complete} done`));
-							if (counts.failed) hParts.push(theme.fg("error", `${counts.failed} failed`));
-							lines.push(hParts.join(theme.fg("dim", "  ·  ")));
-							lines.push(theme.fg("dim", " ↑↓/jk  enter inspect  q close") +
+							// ── Title ──
+							lines.push("");
+							lines.push(pad + theme.fg("accent", "Subagents") +
 								(hiddenCount > 0 ? theme.fg("dim", `  (${hiddenCount} older — /subagents all)`) : ""));
+							lines.push("");
+
+							// ── Tabs ──
+							const tabParts: string[] = [];
+							for (let t = 0; t < tabDefs.length; t++) {
+								const def = tabDefs[t];
+								const count = tabJobs[t].length;
+								const label = `${def.icon} ${def.label} (${count})`;
+								if (t === activeTab) {
+									tabParts.push(theme.fg("accent", `[${label}]`));
+								} else if (count === 0) {
+									tabParts.push(theme.fg("dim", ` ${label} `));
+								} else {
+									tabParts.push(theme.fg("muted", ` ${label} `));
+								}
+							}
+							lines.push(pad + tabParts.join(theme.fg("dim", "  ")));
 							lines.push(sep);
 
-							// Visible window — keep cursor in view
-							const termHeight = process.stdout.rows ?? 24;
-							const maxLines = Math.max(6, Math.floor(termHeight * 0.75) - 5);
-							const maxJobs = Math.floor(maxLines / 3); // 3 lines per job (line1 + line2 + spacer)
-							let scrollStart = 0;
-							if (cursor >= scrollStart + maxJobs) scrollStart = cursor - maxJobs + 1;
-							if (cursor < scrollStart) scrollStart = cursor;
-							const visible = displayJobs.slice(scrollStart, scrollStart + maxJobs);
+							// ── Job list for active tab ──
+							const list = currentList();
 
-							for (let i = 0; i < visible.length; i++) {
-								const job = visible[i];
-								const jobIdx = scrollStart + i;
-								const selected = jobIdx === cursor;
-								const id = job.asyncId.slice(0, 8);
+							if (list.length === 0) {
+								lines.push("");
+								lines.push(pad + theme.fg("dim", `  No ${tabDefs[activeTab].label.toLowerCase()} runs`));
+								lines.push("");
+							} else {
+								const termHeight = process.stdout.rows ?? 24;
+								const maxLines = Math.max(6, Math.floor(termHeight * 0.70) - 8);
+								const maxJobs = Math.floor(maxLines / 3);
+								let scrollStart = 0;
+								if (cursor >= scrollStart + maxJobs) scrollStart = cursor - maxJobs + 1;
+								if (cursor < scrollStart) scrollStart = cursor;
+								const visible = list.slice(scrollStart, scrollStart + maxJobs);
 
-								const icon =
-									job.status === "complete" ? theme.fg("success", "✓")
-									: job.status === "failed" ? theme.fg("error", "✗")
-									: job.status === "running" ? theme.fg("warning", "●")
-									: theme.fg("dim", "○");
+								lines.push(""); // breathing room after tabs
 
-								const end = (job.status === "complete" || job.status === "failed")
-									? (job.updatedAt ?? now) : now;
-								const elapsed = job.startedAt ? fmtElapsed(job.startedAt, end) : "—";
-								const agents = job.agents?.length
-									? job.agents.join(theme.fg("dim", " → "))
-									: (job.mode ?? "?");
+								for (let i = 0; i < visible.length; i++) {
+									const job = visible[i];
+									const jobIdx = scrollStart + i;
+									const selected = jobIdx === cursor;
+									const id = job.asyncId.slice(0, 8);
 
-								// Line 1: cursor indicator + status + agent + elapsed
-								const pointer = selected ? theme.fg("accent", "▸") : " ";
-								lines.push(truncateToWidth(`${pointer}${icon} ${theme.fg("dim", id)}  ${agents}  ${theme.fg("muted", elapsed)}`, width));
+									const icon =
+										job.status === "complete" ? theme.fg("success", "✓")
+										: job.status === "failed" ? theme.fg("error", "✗")
+										: job.status === "running" ? theme.fg("warning", "●")
+										: theme.fg("dim", "○");
 
-								// Line 2: model · cost · tools · activity
-								const parts: string[] = [];
-								const models = [...new Set((job.stepModels ?? []).map(shortModel).filter(Boolean))];
-								if (models.length) parts.push(theme.fg("accent", models.join(theme.fg("dim", ", "))));
-								if (job.liveCost) parts.push(theme.fg("muted", fmtCost(job.liveCost)));
-								if (job.toolCount) parts.push(theme.fg("dim", `${job.toolCount} calls`));
-								if (job.status === "running" && job.currentTool) {
-									const tl = job.currentToolArgs ? `${job.currentTool}(${job.currentToolArgs})` : job.currentTool;
-									parts.push(theme.fg("dim", `→ ${tl}`));
+									const end = (job.status === "complete" || job.status === "failed")
+										? (job.updatedAt ?? now) : now;
+									const elapsed = job.startedAt ? fmtElapsed(job.startedAt, end) : "—";
+									const agents = job.agents?.length
+										? job.agents.join(theme.fg("dim", " → "))
+										: (job.mode ?? "?");
+
+									const pointer = selected ? theme.fg("accent", "▸") : " ";
+									lines.push(truncateToWidth(`${pad}${pointer} ${icon} ${theme.fg("dim", id)}  ${agents}  ${theme.fg("muted", elapsed)}`, width));
+
+									// Detail line
+									const parts: string[] = [];
+									const models = [...new Set((job.stepModels ?? []).map(shortModel).filter(Boolean))];
+									if (models.length) parts.push(theme.fg("accent", models.join(theme.fg("dim", ", "))));
+									if (job.liveCost) parts.push(theme.fg("muted", fmtCost(job.liveCost)));
+									if (job.toolCount) parts.push(theme.fg("dim", `${job.toolCount} calls`));
+									if (job.status === "running" && job.currentTool) {
+										const tl = job.currentToolArgs ? `${job.currentTool}(${job.currentToolArgs})` : job.currentTool;
+										parts.push(theme.fg("dim", `→ ${tl}`));
+									}
+									lines.push(truncateToWidth(`${pad}     ${parts.length ? parts.join(theme.fg("dim", "  ·  ")) : theme.fg("dim", "—")}`, width));
+
+									if (i < visible.length - 1) lines.push(""); // spacer between jobs
 								}
-								lines.push(truncateToWidth(`   ${parts.length ? parts.join(theme.fg("dim", "  ·  ")) : theme.fg("dim", "—")}`, width));
 
-								if (i < visible.length - 1) lines.push("");
+								// Scroll indicators
+								lines.push("");
+								if (scrollStart > 0) lines.push(theme.fg("dim", `${pad}  ↑ ${scrollStart} more`));
+								const below = list.length - scrollStart - maxJobs;
+								if (below > 0) lines.push(theme.fg("dim", `${pad}  ↓ ${below} more`));
 							}
 
-							// Scroll indicators
-							if (scrollStart > 0) lines.push(theme.fg("dim", `   ↑ ${scrollStart} more`));
-							const below = displayJobs.length - scrollStart - maxJobs;
-							if (below > 0) lines.push(theme.fg("dim", `   ↓ ${below} more`));
-
 							lines.push(sep);
+							lines.push(theme.fg("dim", `${pad}↑↓ navigate  tab/←→ switch  enter inspect  q close`));
+							lines.push("");
+
 							cachedWidth = width;
 							cachedLines = lines;
 							return lines;
 						},
 						invalidate() { cachedWidth = undefined; cachedLines = undefined; },
 					};
-				}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "85%" } });
+				}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } });
 			};
 
 			// ── Main loop: list ↔ detail ──
