@@ -103,6 +103,7 @@ function runPiStreaming(
 	outputFile: string,
 	env?: Record<string, string | undefined>,
 	piPackageRoot?: string,
+	onPid?: (pid: number) => void,
 ): Promise<{ stdout: string; exitCode: number | null }> {
 	return new Promise((resolve) => {
 		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
@@ -110,6 +111,8 @@ function runPiStreaming(
 		const spawnSpec = getPiSpawnCommand(args, piPackageRoot ? { piPackageRoot } : undefined);
 		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
 		let stdout = "";
+
+		if (child.pid && onPid) onPid(child.pid);
 
 		child.stdout.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
@@ -348,7 +351,8 @@ async function runSingleStep(
 		mcpEnv.MCP_DIRECT_TOOLS = "__none__";
 	}
 
-	// Heartbeat: periodically update status.json with output log size while step runs
+	// Heartbeat: periodically update status.json with output log size + child process info
+	let heartbeatPid: number | undefined;
 	const heartbeatInterval = setInterval(() => {
 		try {
 			if (ctx.statusPayload && ctx.statusPath) {
@@ -357,14 +361,28 @@ async function runSingleStep(
 					: 0;
 				ctx.statusPayload.lastUpdate = Date.now();
 				if (ctx.statusPayload.steps?.[ctx.flatIndex]) {
-					(ctx.statusPayload.steps[ctx.flatIndex] as Record<string, unknown>).outputBytes = logSize;
+					const stepStatus = ctx.statusPayload.steps[ctx.flatIndex] as Record<string, unknown>;
+					stepStatus.outputBytes = logSize;
+
+					// Detect child pi processes (sync subagent calls) for visibility
+					if (heartbeatPid) {
+						try {
+							const { execSync } = require("node:child_process");
+							// Count pi processes whose parent is our worker
+							const out = execSync(`pgrep -P ${heartbeatPid} -a 2>/dev/null || true`, { encoding: "utf-8", timeout: 2000 });
+							const piChildren = out.split("\n").filter((l: string) => l.includes("pi") && l.includes("-p")).length;
+							if (piChildren > 0) stepStatus.activeChildren = piChildren;
+						} catch {
+							// pgrep not available or timeout — skip
+						}
+					}
 				}
 				writeJson(ctx.statusPath, ctx.statusPayload);
 			}
 		} catch {}
 	}, 15_000);
 
-	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, mcpEnv, ctx.piPackageRoot);
+	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, mcpEnv, ctx.piPackageRoot, (pid) => { heartbeatPid = pid; });
 	clearInterval(heartbeatInterval);
 
 	if (tmpDir) {

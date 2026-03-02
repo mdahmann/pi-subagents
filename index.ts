@@ -950,12 +950,13 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					if (status.steps?.length) {
 						lines.push("", "Steps:");
 						for (let i = 0; i < status.steps.length; i++) {
-							const s = status.steps[i] as { agent: string; model?: string; status: string; exitCode?: number | null; error?: string; tokens?: { input: number; output: number; total: number }; durationMs?: number; outputBytes?: number };
+							const s = status.steps[i] as { agent: string; model?: string; status: string; exitCode?: number | null; error?: string; tokens?: { input: number; output: number; total: number }; durationMs?: number; outputBytes?: number; activeChildren?: number };
 							const dur = s.durationMs ? `${(s.durationMs / 1000).toFixed(1)}s` : "";
 							const tok = s.tokens ? `${s.tokens.total} tokens` : "";
 							const modelTag = s.model ? ` [${s.model}]` : "";
 							const outSize = s.outputBytes ? `${(s.outputBytes / 1024).toFixed(0)}KB output` : "";
-							const info = [dur, tok, outSize].filter(Boolean).join(", ");
+							const children = s.activeChildren ? `${s.activeChildren} subagent${s.activeChildren > 1 ? "s" : ""} active` : "";
+							const info = [dur, tok, outSize, children].filter(Boolean).join(", ");
 							lines.push(`  ${i + 1}. ${s.agent}${modelTag}: ${s.status}${info ? ` (${info})` : ""}`);
 							if (s.error) lines.push(`     ⚠️ ${s.error}`);
 						}
