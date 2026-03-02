@@ -138,13 +138,17 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					job.sessionDir = status.sessionDir ?? job.sessionDir;
 					job.outputFile = status.outputFile ?? job.outputFile;
 					job.totalTokens = status.totalTokens ?? job.totalTokens;
-					// For running jobs, pull live tokens from the active step
-					if (!job.totalTokens && status.steps?.length) {
+					// For running jobs, pull live metrics from the active step
+					if (status.steps?.length) {
 						const activeStep = status.steps[status.currentStep ?? 0] as Record<string, unknown>;
-						const lt = activeStep?.liveTokens as { total?: number; input?: number; output?: number } | undefined;
-						if (lt?.total) {
-							job.totalTokens = { input: lt.input ?? 0, output: lt.output ?? 0, total: lt.total };
+						if (!job.totalTokens) {
+							const lt = activeStep?.liveTokens as { total?: number; input?: number; output?: number } | undefined;
+							if (lt?.total) {
+								job.totalTokens = { input: lt.input ?? 0, output: lt.output ?? 0, total: lt.total };
+							}
 						}
+						job.currentTool = activeStep?.currentTool as string | undefined;
+						job.currentToolArgs = activeStep?.currentToolArgs as string | undefined;
 					}
 					job.sessionFile = status.sessionFile ?? job.sessionFile;
 					// job.shareUrl = status.shareUrl ?? job.shareUrl;

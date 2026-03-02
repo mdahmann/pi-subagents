@@ -161,10 +161,18 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 
 		lines.push(truncLine(`- ${id} ${status} | ${agentLabel} | ${stepText}${elapsed ? ` | ${elapsed}` : ""}${tokenText}${activitySuffix}`, w));
 
-		if (job.status === "running" && job.outputFile) {
-			const tail = getOutputTail(job.outputFile, 1);
-			if (tail.length > 0) {
-				lines.push(truncLine(theme.fg("dim", `  > ${tail[tail.length - 1]}`), w));
+		if (job.status === "running") {
+			// Show current tool from heartbeat (set by poller), or fall back to output tail
+			let preview = "";
+			if (job.currentTool) {
+				const args = job.currentToolArgs ? `(${job.currentToolArgs})` : "";
+				preview = `→ ${job.currentTool}${args}`;
+			} else if (job.outputFile) {
+				const tail = getOutputTail(job.outputFile, 1);
+				if (tail.length > 0) preview = tail[tail.length - 1];
+			}
+			if (preview) {
+				lines.push(truncLine(theme.fg("dim", `  > ${preview}`), w));
 			}
 		}
 	}

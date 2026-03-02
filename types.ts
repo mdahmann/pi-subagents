@@ -174,6 +174,10 @@ export interface AsyncJobState {
 	outputFile?: string;
 	totalTokens?: TokenUsage;
 	sessionFile?: string;
+	/** Current tool being called (from heartbeat) */
+	currentTool?: string;
+	/** Abbreviated args for current tool */
+	currentToolArgs?: string;
 }
 
 // ============================================================================
