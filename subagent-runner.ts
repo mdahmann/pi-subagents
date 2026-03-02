@@ -97,12 +97,17 @@ function parseSessionTokens(sessionDir: string): TokenUsage | null {
 	}
 }
 
-/** Lightweight tool activity tracker parsed from JSONL events */
+/** Lightweight activity tracker parsed from JSONL events */
 interface ToolActivity {
 	currentTool?: string;
 	currentToolArgs?: string;
 	toolCount: number;
 	lastToolAt?: number;
+	tokensIn: number;
+	tokensOut: number;
+	cost: number;
+	turns: number;
+	model?: string;
 }
 
 function runPiStreaming(
@@ -149,6 +154,15 @@ function runPiStreaming(
 						} else if (evt.type === "tool_execution_end") {
 							toolActivity.currentTool = undefined;
 							toolActivity.currentToolArgs = undefined;
+						} else if (evt.type === "message_end" && evt.message?.role === "assistant") {
+							const u = evt.message.usage;
+							if (u) {
+								toolActivity.tokensIn += u.input || 0;
+								toolActivity.tokensOut += u.output || 0;
+								toolActivity.cost += u.cost?.total || 0;
+							}
+							toolActivity.turns++;
+							if (evt.message.model) toolActivity.model = evt.message.model;
 						}
 					} catch {}
 				}
@@ -386,8 +400,8 @@ async function runSingleStep(
 		mcpEnv.MCP_DIRECT_TOOLS = "__none__";
 	}
 
-	// Tool activity tracker — populated by JSONL event parsing in runPiStreaming
-	const toolActivity: ToolActivity = { toolCount: 0 };
+	// Activity tracker — populated by JSONL event parsing in runPiStreaming
+	const toolActivity: ToolActivity = { toolCount: 0, tokensIn: 0, tokensOut: 0, cost: 0, turns: 0 };
 
 	// Heartbeat: periodically update status.json with output log size + tool activity
 	let heartbeatPid: number | undefined;
@@ -414,6 +428,22 @@ async function runSingleStep(
 					} else {
 						delete stepStatus.currentTool;
 						delete stepStatus.currentToolArgs;
+					}
+
+					// Live token/cost tracking from message_end events
+					if (toolActivity.turns > 0) {
+						stepStatus.liveTokens = {
+							input: toolActivity.tokensIn,
+							output: toolActivity.tokensOut,
+							total: toolActivity.tokensIn + toolActivity.tokensOut,
+						};
+						if (toolActivity.cost > 0) {
+							stepStatus.liveCost = toolActivity.cost;
+						}
+						stepStatus.turns = toolActivity.turns;
+					}
+					if (toolActivity.model && !stepStatus.resolvedModel) {
+						stepStatus.resolvedModel = toolActivity.model;
 					}
 
 					// Detect child pi processes (sync subagent calls) for visibility
