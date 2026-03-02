@@ -130,6 +130,7 @@ function runPiStreaming(
 			outputStream.write(text);
 
 			// Parse JSONL events for tool activity tracking
+			// Event types match pi --mode json output (see execution.ts)
 			if (toolActivity) {
 				lineBuf += text;
 				const lines = lineBuf.split("\n");
@@ -138,14 +139,14 @@ function runPiStreaming(
 					if (!line.startsWith("{")) continue;
 					try {
 						const evt = JSON.parse(line);
-						if (evt.type === "tool_call") {
-							toolActivity.currentTool = evt.toolName ?? evt.name;
+						if (evt.type === "tool_execution_start") {
+							toolActivity.currentTool = evt.toolName;
 							toolActivity.currentToolArgs = typeof evt.args === "object"
-								? Object.keys(evt.args).slice(0, 2).join(",")
+								? Object.keys(evt.args as Record<string, unknown>).slice(0, 2).join(",")
 								: undefined;
 							toolActivity.toolCount++;
 							toolActivity.lastToolAt = Date.now();
-						} else if (evt.type === "tool_result") {
+						} else if (evt.type === "tool_execution_end") {
 							toolActivity.currentTool = undefined;
 							toolActivity.currentToolArgs = undefined;
 						}
@@ -439,14 +440,14 @@ async function runSingleStep(
 	}
 
 	// Extract final assistant text from JSONL events (--mode json output)
+	// Event format matches pi --mode json: message_end events with .message.content[]
 	let output = "";
 	const rawStdout = (result.stdout || "").trim();
 	for (const line of rawStdout.split("\n")) {
 		if (!line.startsWith("{")) continue;
 		try {
 			const evt = JSON.parse(line);
-			// pi JSON mode: assistant messages have type "message" with role "assistant"
-			if (evt.type === "message" && evt.message?.role === "assistant") {
+			if (evt.type === "message_end" && evt.message?.role === "assistant") {
 				const content = evt.message.content;
 				if (Array.isArray(content)) {
 					for (const part of content) {
@@ -456,8 +457,6 @@ async function runSingleStep(
 					output = content;
 				}
 			}
-			// Also capture direct text events
-			if (evt.type === "text" && evt.text) output = evt.text;
 		} catch {}
 	}
 	// Fallback: if no structured output found, use raw stdout (plain text mode compat)
