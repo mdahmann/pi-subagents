@@ -245,7 +245,7 @@ export const ASYNC_DIR = path.join(os.tmpdir(), "pi-async-subagent-runs");
 export const WIDGET_KEY = "subagent-async";
 export const POLL_INTERVAL_MS = 250;
 export const MAX_WIDGET_JOBS = 4;
-export const DEFAULT_SUBAGENT_MAX_DEPTH = 2;
+export const DEFAULT_SUBAGENT_MAX_DEPTH = 3;
 
 // ============================================================================
 // Recursion Depth Guard
