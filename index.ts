@@ -950,13 +950,15 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					if (status.steps?.length) {
 						lines.push("", "Steps:");
 						for (let i = 0; i < status.steps.length; i++) {
-							const s = status.steps[i] as { agent: string; model?: string; status: string; exitCode?: number | null; error?: string; tokens?: { input: number; output: number; total: number }; durationMs?: number; outputBytes?: number; activeChildren?: number };
+							const s = status.steps[i] as { agent: string; model?: string; status: string; exitCode?: number | null; error?: string; tokens?: { input: number; output: number; total: number }; durationMs?: number; outputBytes?: number; activeChildren?: number; currentTool?: string; currentToolArgs?: string; toolCount?: number };
 							const dur = s.durationMs ? `${(s.durationMs / 1000).toFixed(1)}s` : "";
 							const tok = s.tokens ? `${s.tokens.total} tokens` : "";
 							const modelTag = s.model ? ` [${s.model}]` : "";
 							const outSize = s.outputBytes ? `${(s.outputBytes / 1024).toFixed(0)}KB output` : "";
 							const children = s.activeChildren ? `${s.activeChildren} subagent${s.activeChildren > 1 ? "s" : ""} active` : "";
-							const info = [dur, tok, outSize, children].filter(Boolean).join(", ");
+							const toolInfo = s.currentTool ? `→ ${s.currentTool}${s.currentToolArgs ? `(${s.currentToolArgs})` : ""}` : "";
+							const toolCount = s.toolCount ? `${s.toolCount} calls` : "";
+							const info = [dur, tok, outSize, children, toolInfo, toolCount].filter(Boolean).join(", ");
 							lines.push(`  ${i + 1}. ${s.agent}${modelTag}: ${s.status}${info ? ` (${info})` : ""}`);
 							if (s.error) lines.push(`     ⚠️ ${s.error}`);
 						}

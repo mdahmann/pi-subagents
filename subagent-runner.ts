@@ -97,6 +97,14 @@ function parseSessionTokens(sessionDir: string): TokenUsage | null {
 	}
 }
 
+/** Lightweight tool activity tracker parsed from JSONL events */
+interface ToolActivity {
+	currentTool?: string;
+	currentToolArgs?: string;
+	toolCount: number;
+	lastToolAt?: number;
+}
+
 function runPiStreaming(
 	args: string[],
 	cwd: string,
@@ -104,6 +112,7 @@ function runPiStreaming(
 	env?: Record<string, string | undefined>,
 	piPackageRoot?: string,
 	onPid?: (pid: number) => void,
+	toolActivity?: ToolActivity,
 ): Promise<{ stdout: string; exitCode: number | null }> {
 	return new Promise((resolve) => {
 		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
@@ -111,6 +120,7 @@ function runPiStreaming(
 		const spawnSpec = getPiSpawnCommand(args, piPackageRoot ? { piPackageRoot } : undefined);
 		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
 		let stdout = "";
+		let lineBuf = "";
 
 		if (child.pid && onPid) onPid(child.pid);
 
@@ -118,6 +128,30 @@ function runPiStreaming(
 			const text = chunk.toString();
 			stdout += text;
 			outputStream.write(text);
+
+			// Parse JSONL events for tool activity tracking
+			if (toolActivity) {
+				lineBuf += text;
+				const lines = lineBuf.split("\n");
+				lineBuf = lines.pop() ?? "";
+				for (const line of lines) {
+					if (!line.startsWith("{")) continue;
+					try {
+						const evt = JSON.parse(line);
+						if (evt.type === "tool_call") {
+							toolActivity.currentTool = evt.toolName ?? evt.name;
+							toolActivity.currentToolArgs = typeof evt.args === "object"
+								? Object.keys(evt.args).slice(0, 2).join(",")
+								: undefined;
+							toolActivity.toolCount++;
+							toolActivity.lastToolAt = Date.now();
+						} else if (evt.type === "tool_result") {
+							toolActivity.currentTool = undefined;
+							toolActivity.currentToolArgs = undefined;
+						}
+					} catch {}
+				}
+			}
 		});
 
 		child.stderr.on("data", (chunk: Buffer) => {
@@ -281,7 +315,7 @@ async function runSingleStep(
 	step: SubagentStep,
 	ctx: SingleStepContext,
 ): Promise<{ agent: string; output: string; exitCode: number | null; artifactPaths?: ArtifactPaths }> {
-	const args = ["-p"];
+	const args = ["--mode", "json", "-p"];
 	if (!ctx.sessionEnabled) {
 		args.push("--no-session");
 	}
@@ -351,7 +385,10 @@ async function runSingleStep(
 		mcpEnv.MCP_DIRECT_TOOLS = "__none__";
 	}
 
-	// Heartbeat: periodically update status.json with output log size + child process info
+	// Tool activity tracker — populated by JSONL event parsing in runPiStreaming
+	const toolActivity: ToolActivity = { toolCount: 0 };
+
+	// Heartbeat: periodically update status.json with output log size + tool activity
 	let heartbeatPid: number | undefined;
 	const heartbeatInterval = setInterval(() => {
 		try {
@@ -364,17 +401,29 @@ async function runSingleStep(
 					const stepStatus = ctx.statusPayload.steps[ctx.flatIndex] as Record<string, unknown>;
 					stepStatus.outputBytes = logSize;
 
+					// Tool activity from JSONL event parsing
+					if (toolActivity.toolCount > 0) {
+						stepStatus.toolCount = toolActivity.toolCount;
+					}
+					if (toolActivity.currentTool) {
+						stepStatus.currentTool = toolActivity.currentTool;
+						if (toolActivity.currentToolArgs) {
+							stepStatus.currentToolArgs = toolActivity.currentToolArgs;
+						}
+					} else {
+						delete stepStatus.currentTool;
+						delete stepStatus.currentToolArgs;
+					}
+
 					// Detect child pi processes (sync subagent calls) for visibility
 					if (heartbeatPid) {
 						try {
 							const { execSync } = require("node:child_process");
-							// Count pi processes whose parent is our worker
 							const out = execSync(`pgrep -P ${heartbeatPid} -a 2>/dev/null || true`, { encoding: "utf-8", timeout: 2000 });
 							const piChildren = out.split("\n").filter((l: string) => l.includes("pi") && l.includes("-p")).length;
 							if (piChildren > 0) stepStatus.activeChildren = piChildren;
-						} catch {
-							// pgrep not available or timeout — skip
-						}
+							else delete stepStatus.activeChildren;
+						} catch {}
 					}
 				}
 				writeJson(ctx.statusPath, ctx.statusPayload);
@@ -382,14 +431,37 @@ async function runSingleStep(
 		} catch {}
 	}, 15_000);
 
-	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, mcpEnv, ctx.piPackageRoot, (pid) => { heartbeatPid = pid; });
+	const result = await runPiStreaming(args, step.cwd ?? ctx.cwd, ctx.outputFile, mcpEnv, ctx.piPackageRoot, (pid) => { heartbeatPid = pid; }, toolActivity);
 	clearInterval(heartbeatInterval);
 
 	if (tmpDir) {
 		try { fs.rmSync(tmpDir, { recursive: true }); } catch {}
 	}
 
-	const output = (result.stdout || "").trim();
+	// Extract final assistant text from JSONL events (--mode json output)
+	let output = "";
+	const rawStdout = (result.stdout || "").trim();
+	for (const line of rawStdout.split("\n")) {
+		if (!line.startsWith("{")) continue;
+		try {
+			const evt = JSON.parse(line);
+			// pi JSON mode: assistant messages have type "message" with role "assistant"
+			if (evt.type === "message" && evt.message?.role === "assistant") {
+				const content = evt.message.content;
+				if (Array.isArray(content)) {
+					for (const part of content) {
+						if (part.type === "text" && part.text) output = part.text;
+					}
+				} else if (typeof content === "string") {
+					output = content;
+				}
+			}
+			// Also capture direct text events
+			if (evt.type === "text" && evt.text) output = evt.text;
+		} catch {}
+	}
+	// Fallback: if no structured output found, use raw stdout (plain text mode compat)
+	if (!output) output = rawStdout;
 	let outputForSummary = output;
 	if (step.outputPath && result.exitCode === 0) {
 		const persisted = persistSingleOutput(step.outputPath, output);
