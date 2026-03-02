@@ -17,7 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Text, matchesKey, Key, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { type AgentConfig, type AgentScope, discoverAgents, discoverAgentsAll } from "./agents.js";
 import { resolveExecutionAgentScope } from "./agent-scope.js";
 import { cleanupOldChainDirs, getStepAgents, isParallelStep, resolveStepBehavior, type ChainStep, type SequentialStep } from "./settings.js";
@@ -41,7 +41,7 @@ import {
 	WIDGET_KEY,
 	checkSubagentDepth,
 } from "./types.js";
-import { readStatus, findByPrefix, getFinalOutput, mapConcurrent } from "./utils.js";
+import { readStatus, findByPrefix, getFinalOutput, mapConcurrent, getLastActivity } from "./utils.js";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.js";
 import { createFileCoalescer } from "./file-coalescer.js";
 import { runSync } from "./execution.js";
@@ -1360,6 +1360,127 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			const params: Record<string, unknown> = { chain: [{ parallel: tasks }], task: parsed.task, clarify: false, agentScope: "both" };
 			if (bg) params.async = true;
 			pi.sendUserMessage(`Call the subagent tool with these exact parameters: ${JSON.stringify(params)}`);
+		},
+	});
+
+	pi.registerCommand("subagents", {
+		description: "Show all async subagent runs (scrollable overlay)",
+		handler: async (_args, ctx) => {
+			const jobs = Array.from(asyncJobs.values());
+			if (jobs.length === 0) {
+				ctx.ui.notify("No async subagent runs", "info");
+				return;
+			}
+
+			// Also scan disk for any runs not in memory
+			try {
+				const dirs = fs.readdirSync(ASYNC_DIR).filter(d => {
+					try { return fs.statSync(path.join(ASYNC_DIR, d)).isDirectory(); } catch { return false; }
+				});
+				for (const dir of dirs) {
+					const existingIds = new Set(jobs.map(j => j.asyncId));
+					if (!existingIds.has(dir)) {
+						const status = readStatus(path.join(ASYNC_DIR, dir));
+						if (status) {
+							jobs.push({
+								asyncId: dir.slice(0, 36),
+								asyncDir: path.join(ASYNC_DIR, dir),
+								status: status.state ?? "unknown",
+								mode: status.mode ?? "single",
+								agents: status.steps?.map((s: { agent: string }) => s.agent),
+								stepsTotal: status.steps?.length,
+								startedAt: status.startedAt,
+								updatedAt: status.lastUpdate,
+								outputFile: status.outputFile,
+							});
+						}
+					}
+				}
+			} catch {}
+
+			// Sort: running first, then by start time desc
+			jobs.sort((a, b) => {
+				const aRunning = a.status === "running" || a.status === "queued" ? 0 : 1;
+				const bRunning = b.status === "running" || b.status === "queued" ? 0 : 1;
+				if (aRunning !== bRunning) return aRunning - bRunning;
+				return (b.startedAt ?? 0) - (a.startedAt ?? 0);
+			});
+
+			await ctx.ui.custom((tui, theme, _kb, done) => {
+				let scrollOffset = 0;
+				let cachedWidth: number | undefined;
+				let cachedLines: string[] | undefined;
+
+				return {
+					handleInput(data: string) {
+						if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
+							done(null);
+						} else if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+							if (scrollOffset > 0) { scrollOffset--; cachedWidth = undefined; tui.requestRender(); }
+						} else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+							scrollOffset++; cachedWidth = undefined; tui.requestRender();
+						} else if (matchesKey(data, Key.home)) {
+							scrollOffset = 0; cachedWidth = undefined; tui.requestRender();
+						} else if (matchesKey(data, Key.end)) {
+							scrollOffset = Math.max(0, jobs.length - 5); cachedWidth = undefined; tui.requestRender();
+						}
+					},
+					render(width: number): string[] {
+						if (cachedLines && cachedWidth === width) return cachedLines;
+
+						const lines: string[] = [];
+						const now = Date.now();
+
+						lines.push(theme.fg("accent", `Async Subagents (${jobs.length} runs)`) + theme.fg("dim", "  ↑↓/jk scroll  q/esc close"));
+						lines.push(theme.fg("dim", "─".repeat(Math.min(width, 80))));
+
+						const maxVisible = Math.max(5, Math.floor((tui.height ?? 24) * 0.7) - 4);
+						const visible = jobs.slice(scrollOffset, scrollOffset + maxVisible);
+
+						for (const job of visible) {
+							const id = job.asyncId.slice(0, 6);
+							const statusText =
+								job.status === "complete" ? theme.fg("success", "✓ complete")
+								: job.status === "failed" ? theme.fg("error", "✗ failed")
+								: job.status === "running" ? theme.fg("warning", "● running")
+								: theme.fg("dim", "○ " + (job.status ?? "unknown"));
+
+							const agentLabel = job.agents?.join(" → ") ?? (job.mode ?? "?");
+							let elapsed = "";
+							if (job.startedAt) {
+								const ms = (job.status === "complete" || job.status === "failed" ? (job.updatedAt ?? now) : now) - job.startedAt;
+								const s = Math.floor(ms / 1000);
+								if (s >= 3600) elapsed = `${Math.floor(s/3600)}h${Math.floor((s%3600)/60)}m`;
+								else if (s >= 60) elapsed = `${Math.floor(s/60)}m${s%60}s`;
+								else elapsed = `${s}s`;
+							}
+
+							const activity = (job.status === "running" && job.outputFile) ? getLastActivity(job.outputFile) : "";
+							const activitySuffix = activity && activity !== "DEAD" ? theme.fg("dim", ` | ${activity}`) : "";
+							if (activity === "DEAD") {
+								job.status = "failed";
+							}
+
+							const line = `  ${theme.fg("dim", id)} ${statusText} ${theme.fg("muted", "|")} ${agentLabel} ${theme.fg("muted", "|")} ${elapsed}${activitySuffix}`;
+							lines.push(truncateToWidth(line, width));
+						}
+
+						if (scrollOffset > 0) {
+							lines.push(theme.fg("dim", `  ↑ ${scrollOffset} more above`));
+						}
+						if (scrollOffset + maxVisible < jobs.length) {
+							lines.push(theme.fg("dim", `  ↓ ${jobs.length - scrollOffset - maxVisible} more below`));
+						}
+
+						lines.push(theme.fg("dim", "─".repeat(Math.min(width, 80))));
+
+						cachedWidth = width;
+						cachedLines = lines;
+						return lines;
+					},
+					invalidate() { cachedWidth = undefined; cachedLines = undefined; },
+				};
+			}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "80%" } });
 		},
 	});
 
