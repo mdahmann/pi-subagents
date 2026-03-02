@@ -290,13 +290,16 @@ async function runSingleStep(
 
 	const toolExtensionPaths: string[] = [];
 	if (step.tools?.length) {
+		const KNOWN_BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 		const builtinTools: string[] = [];
 		for (const tool of step.tools) {
 			if (tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")) {
 				toolExtensionPaths.push(tool);
-			} else {
+			} else if (KNOWN_BUILTIN_TOOLS.has(tool)) {
 				builtinTools.push(tool);
 			}
+			// Extension-provided tools (e.g. "subagent") are silently skipped —
+			// they're made available by the extensions list, not --tools.
 		}
 		if (builtinTools.length > 0) args.push("--tools", builtinTools.join(","));
 	}
