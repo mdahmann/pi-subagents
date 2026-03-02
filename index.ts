@@ -1380,7 +1380,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		description: "Show all async subagent runs. Usage: /subagents [all]",
 		handler: async (args, ctx) => {
 			const showAll = args.trim().toLowerCase() === "all";
-			const MAX_RECENT = 30; // default cap unless "all"
+			const MAX_RECENT = 30;
 
 			// ── Collect jobs from memory + disk ──
 			const jobs: AsyncJobState[] = Array.from(asyncJobs.values());
@@ -1421,10 +1421,9 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				}
 			} catch {}
 
-			// ── Detect dead processes BEFORE sorting ──
+			// ── Detect dead processes ──
 			for (const job of jobs) {
 				if (job.status !== "running") continue;
-				// Quick PID check — faster than getLastActivity's file stat
 				try {
 					const statusPath = path.join(job.asyncDir, "status.json");
 					const raw = fs.readFileSync(statusPath, "utf-8");
@@ -1432,7 +1431,6 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					if (sj.pid) {
 						try { process.kill(sj.pid, 0); } catch {
 							job.status = "failed";
-							// Write back so future reads see it
 							sj.state = "failed";
 							sj.endedAt = sj.endedAt ?? Date.now();
 							sj.lastUpdate = Date.now();
@@ -1448,7 +1446,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				return;
 			}
 
-			// ── Sort: running → queued → failed → complete, then newest first ──
+			// ── Sort ──
 			jobs.sort((a, b) => {
 				const rank = (s: string) => s === "running" ? 0 : s === "queued" ? 1 : s === "failed" ? 2 : 3;
 				const r = rank(a.status) - rank(b.status);
@@ -1456,7 +1454,6 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				return (b.startedAt ?? 0) - (a.startedAt ?? 0);
 			});
 
-			// ── Apply cap: always show ALL running/queued, cap completed/failed ──
 			const activeJobs = jobs.filter(j => j.status === "running" || j.status === "queued");
 			const finishedJobs = jobs.filter(j => j.status !== "running" && j.status !== "queued");
 			const displayJobs = showAll
@@ -1464,7 +1461,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				: [...activeJobs, ...finishedJobs.slice(0, Math.max(0, MAX_RECENT - activeJobs.length))];
 			const hiddenCount = jobs.length - displayJobs.length;
 
-			// ── Helpers ──
+			// ── Shared helpers ──
 			const fmtElapsed = (startMs: number, endMs: number): string => {
 				const s = Math.floor((endMs - startMs) / 1000);
 				if (s >= 3600) return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
@@ -1473,111 +1470,321 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			};
 			const shortModel = (m: string): string => {
 				if (!m) return "";
-				const slashIdx = m.indexOf("/");
-				let name = slashIdx >= 0 ? m.slice(slashIdx + 1) : m;
-				const colonIdx = name.indexOf(":");
-				if (colonIdx >= 0) name = name.slice(0, colonIdx);
+				const idx = m.indexOf("/");
+				let name = idx >= 0 ? m.slice(idx + 1) : m;
+				const c = name.indexOf(":");
+				if (c >= 0) name = name.slice(0, c);
 				return name;
 			};
 			const fmtCost = (c: number): string => c >= 0.01 ? `$${c.toFixed(2)}` : `$${c.toFixed(3)}`;
 
-			// ── Overlay ──
-			await ctx.ui.custom((tui, theme, _kb, done) => {
-				let scrollOffset = 0;
-				let cachedWidth: number | undefined;
-				let cachedLines: string[] | undefined;
+			// ── Parse output JSONL into readable timeline ──
+			const parseOutputLog = (logPath: string, maxEntries = 200): string[] => {
+				const entries: string[] = [];
+				try {
+					const content = fs.readFileSync(logPath, "utf-8");
+					const lines = content.split("\n");
+					for (const line of lines) {
+						if (!line.startsWith("{")) continue;
+						let evt: Record<string, unknown>;
+						try { evt = JSON.parse(line); } catch { continue; }
 
-				return {
-					handleInput(data: string) {
-						if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
-							done(null);
-						} else if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
-							if (scrollOffset > 0) { scrollOffset--; cachedWidth = undefined; tui.requestRender(); }
-						} else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
-							if (scrollOffset < displayJobs.length - 1) { scrollOffset++; cachedWidth = undefined; tui.requestRender(); }
-						} else if (matchesKey(data, Key.home) || matchesKey(data, "g")) {
-							scrollOffset = 0; cachedWidth = undefined; tui.requestRender();
-						} else if (matchesKey(data, Key.end) || matchesKey(data, "G")) {
-							scrollOffset = Math.max(0, displayJobs.length - 1); cachedWidth = undefined; tui.requestRender();
+						const type = evt.type as string;
+						if (type === "tool_execution_start") {
+							const name = evt.toolName as string ?? "?";
+							const a = evt.args as Record<string, unknown> | undefined;
+							let argStr = "";
+							if (a) {
+								const parts = Object.entries(a).slice(0, 3).map(([k, v]) => {
+									const vs = String(v);
+									return `${k}=${vs.length > 40 ? vs.slice(0, 37) + "..." : vs}`;
+								});
+								argStr = parts.join(", ");
+							}
+							entries.push(`🔧 ${name}(${argStr})`);
+						} else if (type === "message_end") {
+							const msg = evt.message as Record<string, unknown> | undefined;
+							const content = msg?.content as Array<Record<string, unknown>> | undefined;
+							const usage = msg?.usage as Record<string, unknown> | undefined;
+							const model = (msg?.model ?? "") as string;
+							if (content) {
+								for (const part of content) {
+									if (part.type === "text" && typeof part.text === "string") {
+										const text = (part.text as string).trim();
+										if (text) {
+											// Show first ~3 lines of assistant text
+											const preview = text.split("\n").slice(0, 3).join(" ").slice(0, 200);
+											const modelTag = model ? ` [${shortModel(model)}]` : "";
+											const costTag = usage ? ` (${usage.input_tokens ?? "?"}→${usage.output_tokens ?? "?"} tok)` : "";
+											entries.push(`💬${modelTag}${costTag} ${preview}`);
+										}
+									}
+								}
+							}
+						} else if (type === "error") {
+							const msg = (evt.message ?? evt.error ?? "unknown error") as string;
+							entries.push(`❌ ${msg.slice(0, 200)}`);
 						}
-					},
-					render(width: number): string[] {
-						if (cachedLines && cachedWidth === width) return cachedLines;
+						if (entries.length >= maxEntries) break;
+					}
+				} catch (e) {
+					entries.push(`(could not read log: ${(e as Error).message})`);
+				}
+				return entries;
+			};
 
-						const lines: string[] = [];
-						const now = Date.now();
-						const w = Math.min(width, 100);
-						const sep = theme.fg("dim", "─".repeat(w));
+			// ── Detail overlay for a single job ──
+			const showDetail = async (job: AsyncJobState): Promise<void> => {
+				// Gather all readable info
+				const logPath = job.outputFile ?? path.join(job.asyncDir, "output-0.log");
+				const timeline = parseOutputLog(logPath);
 
-						// ── Header ──
-						const counts = { running: 0, queued: 0, complete: 0, failed: 0 };
-						for (const j of jobs) counts[j.status] = (counts[j.status] ?? 0) + 1;
-						const hParts = [theme.fg("accent", ` Subagents`)];
-						if (counts.running) hParts.push(theme.fg("warning", `${counts.running} running`));
-						if (counts.queued) hParts.push(theme.fg("dim", `${counts.queued} queued`));
-						if (counts.complete) hParts.push(theme.fg("success", `${counts.complete} done`));
-						if (counts.failed) hParts.push(theme.fg("error", `${counts.failed} failed`));
-						lines.push(hParts.join(theme.fg("dim", "  ·  ")));
-						lines.push(theme.fg("dim", " ↑↓/jk scroll  g/G jump  q close") +
-							(hiddenCount > 0 ? theme.fg("dim", `  (${hiddenCount} older hidden — /subagents all)`) : ""));
-						lines.push(sep);
+				// Read status.json for step details
+				let statusInfo: string[] = [];
+				try {
+					const sj = JSON.parse(fs.readFileSync(path.join(job.asyncDir, "status.json"), "utf-8"));
+					if (sj.error) statusInfo.push(`Error: ${sj.error}`);
+					if (sj.steps?.length) {
+						for (let si = 0; si < sj.steps.length; si++) {
+							const step = sj.steps[si];
+							const m = shortModel(step.resolvedModel ?? step.model ?? "");
+							const dur = step.durationMs ? fmtElapsed(0, step.durationMs) : "—";
+							const cost = typeof step.liveCost === "number" ? fmtCost(step.liveCost) : "";
+							const tok = step.liveTokens?.total ? `${step.liveTokens.total} tok` : (step.tokens?.total ? `${step.tokens.total} tok` : "");
+							const tools = typeof step.toolCount === "number" ? `${step.toolCount} calls` : "";
+							const info = [m, dur, cost, tok, tools].filter(Boolean).join("  ·  ");
+							statusInfo.push(`Step ${si + 1}: ${step.agent} [${step.status}]  ${info}`);
+						}
+					}
+				} catch {}
 
-						// ── Visible window ──
-						const termHeight = process.stdout.rows ?? 24;
-						const maxLines = Math.max(6, Math.floor(termHeight * 0.75) - 5);
-						const maxJobs = Math.floor(maxLines / 2);
-						const clamped = Math.min(scrollOffset, Math.max(0, displayJobs.length - maxJobs));
-						const visible = displayJobs.slice(clamped, clamped + maxJobs);
+				// Check for artifacts (subagent log, output markdown)
+				let artifactContent = "";
+				const mdLog = path.join(job.asyncDir, `subagent-log-${job.asyncId}.md`);
+				if (fs.existsSync(mdLog)) {
+					try { artifactContent = fs.readFileSync(mdLog, "utf-8"); } catch {}
+				}
+				// Also check for _output.md artifact
+				try {
+					const artDir = tempArtifactsDir ?? "/tmp/pi-subagent-artifacts";
+					const outputs = fs.readdirSync(artDir)
+						.filter(f => f.startsWith(job.asyncId.slice(0, 8)) && f.endsWith("_output.md"));
+					for (const o of outputs) {
+						const content = fs.readFileSync(path.join(artDir, o), "utf-8");
+						if (content.trim()) {
+							artifactContent += `\n\n--- ${o} ---\n${content.slice(0, 3000)}`;
+						}
+					}
+				} catch {}
 
-						for (let i = 0; i < visible.length; i++) {
-							const job = visible[i];
+				// Build detail lines
+				const allLines: string[] = [];
+				if (statusInfo.length) {
+					allLines.push("STEPS");
+					allLines.push(...statusInfo);
+					allLines.push("");
+				}
+				if (timeline.length) {
+					allLines.push(`ACTIVITY LOG (${timeline.length} events)`);
+					allLines.push(...timeline);
+					allLines.push("");
+				}
+				if (artifactContent.trim()) {
+					allLines.push("OUTPUT");
+					allLines.push(...artifactContent.trim().split("\n").slice(0, 100));
+				}
+				if (allLines.length === 0) {
+					allLines.push("(no output data available)");
+				}
+
+				await ctx.ui.custom((tui, theme, _kb, done) => {
+					let scroll = 0;
+					let cW: number | undefined;
+					let cL: string[] | undefined;
+
+					return {
+						handleInput(data: string) {
+							if (matchesKey(data, Key.escape) || matchesKey(data, "q") || matchesKey(data, Key.backspace)) {
+								done(null);
+							} else if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+								if (scroll > 0) { scroll--; cW = undefined; tui.requestRender(); }
+							} else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+								if (scroll < allLines.length - 1) { scroll++; cW = undefined; tui.requestRender(); }
+							} else if (matchesKey(data, Key.home) || matchesKey(data, "g")) {
+								scroll = 0; cW = undefined; tui.requestRender();
+							} else if (matchesKey(data, Key.end) || matchesKey(data, "G")) {
+								scroll = Math.max(0, allLines.length - 5); cW = undefined; tui.requestRender();
+							}
+						},
+						render(width: number): string[] {
+							if (cL && cW === width) return cL;
+							const now = Date.now();
+							const w = Math.min(width, 100);
+							const sep = theme.fg("dim", "─".repeat(w));
+							const out: string[] = [];
+
+							// Header
 							const id = job.asyncId.slice(0, 8);
-
-							const icon =
-								job.status === "complete" ? theme.fg("success", "✓")
+							const icon = job.status === "complete" ? theme.fg("success", "✓")
 								: job.status === "failed" ? theme.fg("error", "✗")
 								: job.status === "running" ? theme.fg("warning", "●")
 								: theme.fg("dim", "○");
-
-							const end = (job.status === "complete" || job.status === "failed")
-								? (job.updatedAt ?? now) : now;
+							const agents = job.agents?.join(" → ") ?? "?";
+							const end = (job.status === "complete" || job.status === "failed") ? (job.updatedAt ?? now) : now;
 							const elapsed = job.startedAt ? fmtElapsed(job.startedAt, end) : "—";
-
-							const agents = job.agents?.length
-								? job.agents.join(theme.fg("dim", " → "))
-								: (job.mode ?? "?");
-
-							// Line 1: icon  id  agent(s)  elapsed
-							lines.push(truncateToWidth(` ${icon} ${theme.fg("dim", id)}  ${agents}  ${theme.fg("muted", elapsed)}`, width));
-
-							// Line 2: model · cost · tools · activity
-							const parts: string[] = [];
 							const models = [...new Set((job.stepModels ?? []).map(shortModel).filter(Boolean))];
-							if (models.length) parts.push(theme.fg("accent", models.join(theme.fg("dim", ", "))));
-							if (job.liveCost) parts.push(theme.fg("muted", fmtCost(job.liveCost)));
-							if (job.toolCount) parts.push(theme.fg("dim", `${job.toolCount} calls`));
-							if (job.status === "running" && job.currentTool) {
-								const tl = job.currentToolArgs ? `${job.currentTool}(${job.currentToolArgs})` : job.currentTool;
-								parts.push(theme.fg("dim", `→ ${tl}`));
+
+							out.push(` ${icon} ${theme.fg("dim", id)}  ${agents}  ${theme.fg("muted", elapsed)}`);
+							const meta: string[] = [];
+							if (models.length) meta.push(theme.fg("accent", models.join(", ")));
+							if (job.liveCost) meta.push(fmtCost(job.liveCost));
+							if (job.toolCount) meta.push(`${job.toolCount} calls`);
+							if (meta.length) out.push(theme.fg("muted", `   ${meta.join("  ·  ")}`));
+							out.push(theme.fg("dim", " ↑↓/jk scroll  g/G jump  esc/q back"));
+							out.push(sep);
+
+							// Scrollable content
+							const termH = process.stdout.rows ?? 24;
+							const maxVisible = Math.max(5, Math.floor(termH * 0.75) - 6);
+							const clamped = Math.min(scroll, Math.max(0, allLines.length - maxVisible));
+							const visible = allLines.slice(clamped, clamped + maxVisible);
+
+							for (const line of visible) {
+								let styled = line;
+								if (line.startsWith("🔧")) styled = theme.fg("muted", line);
+								else if (line.startsWith("💬")) styled = line; // keep emoji
+								else if (line.startsWith("❌")) styled = theme.fg("error", line);
+								else if (line === line.toUpperCase() && line.length > 2 && !line.startsWith("(")) styled = theme.fg("accent", ` ${line}`);
+								else styled = ` ${line}`;
+								out.push(truncateToWidth(styled, width));
 							}
-							lines.push(truncateToWidth(`   ${parts.length ? parts.join(theme.fg("dim", "  ·  ")) : theme.fg("dim", "—")}`, width));
 
-							if (i < visible.length - 1) lines.push("");
-						}
+							if (clamped > 0) out.push(theme.fg("dim", `   ↑ ${clamped} more`));
+							const below = allLines.length - clamped - maxVisible;
+							if (below > 0) out.push(theme.fg("dim", `   ↓ ${below} more`));
+							out.push(sep);
 
-						// ── Scroll indicators ──
-						if (clamped > 0) lines.push(theme.fg("dim", `   ↑ ${clamped} more`));
-						const below = displayJobs.length - clamped - maxJobs;
-						if (below > 0) lines.push(theme.fg("dim", `   ↓ ${below} more`));
+							cW = width;
+							cL = out;
+							return out;
+						},
+						invalidate() { cW = undefined; cL = undefined; },
+					};
+				}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } });
+			};
 
-						lines.push(sep);
-						cachedWidth = width;
-						cachedLines = lines;
-						return lines;
-					},
-					invalidate() { cachedWidth = undefined; cachedLines = undefined; },
-				};
-			}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "85%" } });
+			// ── List overlay (returns selected job or null) ──
+			const showList = async (): Promise<AsyncJobState | null> => {
+				return ctx.ui.custom<AsyncJobState | null>((tui, theme, _kb, done) => {
+					let cursor = 0;
+					let cachedWidth: number | undefined;
+					let cachedLines: string[] | undefined;
+
+					return {
+						handleInput(data: string) {
+							if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
+								done(null);
+							} else if (matchesKey(data, Key.enter)) {
+								if (displayJobs[cursor]) done(displayJobs[cursor]);
+							} else if (matchesKey(data, Key.up) || matchesKey(data, "k")) {
+								if (cursor > 0) { cursor--; cachedWidth = undefined; tui.requestRender(); }
+							} else if (matchesKey(data, Key.down) || matchesKey(data, "j")) {
+								if (cursor < displayJobs.length - 1) { cursor++; cachedWidth = undefined; tui.requestRender(); }
+							} else if (matchesKey(data, Key.home) || matchesKey(data, "g")) {
+								cursor = 0; cachedWidth = undefined; tui.requestRender();
+							} else if (matchesKey(data, Key.end) || matchesKey(data, "G")) {
+								cursor = displayJobs.length - 1; cachedWidth = undefined; tui.requestRender();
+							}
+						},
+						render(width: number): string[] {
+							if (cachedLines && cachedWidth === width) return cachedLines;
+
+							const lines: string[] = [];
+							const now = Date.now();
+							const w = Math.min(width, 100);
+							const sep = theme.fg("dim", "─".repeat(w));
+
+							// Header
+							const counts = { running: 0, queued: 0, complete: 0, failed: 0 };
+							for (const j of jobs) counts[j.status] = (counts[j.status] ?? 0) + 1;
+							const hParts = [theme.fg("accent", ` Subagents`)];
+							if (counts.running) hParts.push(theme.fg("warning", `${counts.running} running`));
+							if (counts.queued) hParts.push(theme.fg("dim", `${counts.queued} queued`));
+							if (counts.complete) hParts.push(theme.fg("success", `${counts.complete} done`));
+							if (counts.failed) hParts.push(theme.fg("error", `${counts.failed} failed`));
+							lines.push(hParts.join(theme.fg("dim", "  ·  ")));
+							lines.push(theme.fg("dim", " ↑↓/jk  enter inspect  q close") +
+								(hiddenCount > 0 ? theme.fg("dim", `  (${hiddenCount} older — /subagents all)`) : ""));
+							lines.push(sep);
+
+							// Visible window — keep cursor in view
+							const termHeight = process.stdout.rows ?? 24;
+							const maxLines = Math.max(6, Math.floor(termHeight * 0.75) - 5);
+							const maxJobs = Math.floor(maxLines / 3); // 3 lines per job (line1 + line2 + spacer)
+							let scrollStart = 0;
+							if (cursor >= scrollStart + maxJobs) scrollStart = cursor - maxJobs + 1;
+							if (cursor < scrollStart) scrollStart = cursor;
+							const visible = displayJobs.slice(scrollStart, scrollStart + maxJobs);
+
+							for (let i = 0; i < visible.length; i++) {
+								const job = visible[i];
+								const jobIdx = scrollStart + i;
+								const selected = jobIdx === cursor;
+								const id = job.asyncId.slice(0, 8);
+
+								const icon =
+									job.status === "complete" ? theme.fg("success", "✓")
+									: job.status === "failed" ? theme.fg("error", "✗")
+									: job.status === "running" ? theme.fg("warning", "●")
+									: theme.fg("dim", "○");
+
+								const end = (job.status === "complete" || job.status === "failed")
+									? (job.updatedAt ?? now) : now;
+								const elapsed = job.startedAt ? fmtElapsed(job.startedAt, end) : "—";
+								const agents = job.agents?.length
+									? job.agents.join(theme.fg("dim", " → "))
+									: (job.mode ?? "?");
+
+								// Line 1: cursor indicator + status + agent + elapsed
+								const pointer = selected ? theme.fg("accent", "▸") : " ";
+								lines.push(truncateToWidth(`${pointer}${icon} ${theme.fg("dim", id)}  ${agents}  ${theme.fg("muted", elapsed)}`, width));
+
+								// Line 2: model · cost · tools · activity
+								const parts: string[] = [];
+								const models = [...new Set((job.stepModels ?? []).map(shortModel).filter(Boolean))];
+								if (models.length) parts.push(theme.fg("accent", models.join(theme.fg("dim", ", "))));
+								if (job.liveCost) parts.push(theme.fg("muted", fmtCost(job.liveCost)));
+								if (job.toolCount) parts.push(theme.fg("dim", `${job.toolCount} calls`));
+								if (job.status === "running" && job.currentTool) {
+									const tl = job.currentToolArgs ? `${job.currentTool}(${job.currentToolArgs})` : job.currentTool;
+									parts.push(theme.fg("dim", `→ ${tl}`));
+								}
+								lines.push(truncateToWidth(`   ${parts.length ? parts.join(theme.fg("dim", "  ·  ")) : theme.fg("dim", "—")}`, width));
+
+								if (i < visible.length - 1) lines.push("");
+							}
+
+							// Scroll indicators
+							if (scrollStart > 0) lines.push(theme.fg("dim", `   ↑ ${scrollStart} more`));
+							const below = displayJobs.length - scrollStart - maxJobs;
+							if (below > 0) lines.push(theme.fg("dim", `   ↓ ${below} more`));
+
+							lines.push(sep);
+							cachedWidth = width;
+							cachedLines = lines;
+							return lines;
+						},
+						invalidate() { cachedWidth = undefined; cachedLines = undefined; },
+					};
+				}, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "85%" } });
+			};
+
+			// ── Main loop: list ↔ detail ──
+			let selected: AsyncJobState | null;
+			do {
+				selected = await showList();
+				if (selected) await showDetail(selected);
+			} while (selected !== null);
 		},
 	});
 
