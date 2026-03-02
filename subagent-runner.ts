@@ -108,7 +108,11 @@ interface ToolActivity {
 	cost: number;
 	turns: number;
 	model?: string;
+	lastAssistantText?: string;
 }
+
+const MAX_OUTPUT_LOG_BYTES = 500 * 1024 * 1024; // 500MB hard cap per running subagent log
+const OUTPUT_LOG_CAPPED_NOTICE = "\n[pi-subagents] output log capped at 500MB; further output omitted\n";
 
 function runPiStreaming(
 	args: string[],
@@ -125,53 +129,91 @@ function runPiStreaming(
 		const spawnSpec = getPiSpawnCommand(args, piPackageRoot ? { piPackageRoot } : undefined);
 		const child = spawn(spawnSpec.command, spawnSpec.args, { cwd, stdio: ["ignore", "pipe", "pipe"], env: spawnEnv });
 		let lineBuf = "";
+		let writtenBytes = 0;
+		let logCapped = false;
+
+		const writeWithCap = (text: string): void => {
+			if (!text || logCapped) return;
+			const buf = Buffer.from(text);
+			if (writtenBytes + buf.length <= MAX_OUTPUT_LOG_BYTES) {
+				outputStream.write(buf);
+				writtenBytes += buf.length;
+				return;
+			}
+
+			const remaining = MAX_OUTPUT_LOG_BYTES - writtenBytes;
+			if (remaining > 0) {
+				outputStream.write(buf.subarray(0, remaining));
+				writtenBytes += remaining;
+			}
+			outputStream.write(OUTPUT_LOG_CAPPED_NOTICE);
+			logCapped = true;
+		};
+
+		const parseActivityLine = (line: string): void => {
+			if (!toolActivity || !line.startsWith("{")) return;
+			try {
+				const evt = JSON.parse(line);
+				if (evt.type === "tool_execution_start") {
+					toolActivity.currentTool = evt.toolName;
+					toolActivity.currentToolArgs = typeof evt.args === "object"
+						? Object.keys(evt.args as Record<string, unknown>).slice(0, 2).join(",")
+						: undefined;
+					toolActivity.toolCount++;
+					toolActivity.lastToolAt = Date.now();
+				} else if (evt.type === "tool_execution_end") {
+					toolActivity.currentTool = undefined;
+					toolActivity.currentToolArgs = undefined;
+				} else if (evt.type === "message_end" && evt.message?.role === "assistant") {
+					const u = evt.message.usage;
+					if (u) {
+						toolActivity.tokensIn += u.input || 0;
+						toolActivity.tokensOut += u.output || 0;
+						toolActivity.cost += u.cost?.total || 0;
+					}
+					toolActivity.turns++;
+					if (evt.message.model) toolActivity.model = evt.message.model;
+					const content = evt.message?.content;
+					if (Array.isArray(content)) {
+						for (const part of content) {
+							if (part?.type === "text" && typeof part.text === "string") {
+								toolActivity.lastAssistantText = part.text;
+							}
+						}
+					} else if (typeof content === "string") {
+						toolActivity.lastAssistantText = content;
+					}
+				}
+			} catch {}
+		};
 
 		if (child.pid && onPid) onPid(child.pid);
 
 		child.stdout.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
-			outputStream.write(text);
+			lineBuf += text;
+			const lines = lineBuf.split("\n");
+			lineBuf = lines.pop() ?? "";
 
-			// Parse JSONL events for tool activity tracking
-			// Event types match pi --mode json output (see execution.ts)
-			if (toolActivity) {
-				lineBuf += text;
-				const lines = lineBuf.split("\n");
-				lineBuf = lines.pop() ?? "";
-				for (const line of lines) {
-					if (!line.startsWith("{")) continue;
-					try {
-						const evt = JSON.parse(line);
-						if (evt.type === "tool_execution_start") {
-							toolActivity.currentTool = evt.toolName;
-							toolActivity.currentToolArgs = typeof evt.args === "object"
-								? Object.keys(evt.args as Record<string, unknown>).slice(0, 2).join(",")
-								: undefined;
-							toolActivity.toolCount++;
-							toolActivity.lastToolAt = Date.now();
-						} else if (evt.type === "tool_execution_end") {
-							toolActivity.currentTool = undefined;
-							toolActivity.currentToolArgs = undefined;
-						} else if (evt.type === "message_end" && evt.message?.role === "assistant") {
-							const u = evt.message.usage;
-							if (u) {
-								toolActivity.tokensIn += u.input || 0;
-								toolActivity.tokensOut += u.output || 0;
-								toolActivity.cost += u.cost?.total || 0;
-							}
-							toolActivity.turns++;
-							if (evt.message.model) toolActivity.model = evt.message.model;
-						}
-					} catch {}
-				}
+			for (const line of lines) {
+				parseActivityLine(line);
+				// Skip huge incremental thinking deltas from persisted logs.
+				if (line.startsWith("{") && line.includes('"message_update"')) continue;
+				writeWithCap(`${line}\n`);
 			}
 		});
 
 		child.stderr.on("data", (chunk: Buffer) => {
-			outputStream.write(chunk.toString());
+			writeWithCap(chunk.toString());
 		});
 
 		child.on("close", (exitCode) => {
+			if (lineBuf) {
+				parseActivityLine(lineBuf);
+				if (!(lineBuf.startsWith("{") && lineBuf.includes('"message_update"'))) {
+					writeWithCap(lineBuf);
+				}
+			}
 			outputStream.end();
 			resolve({ stdout: outputFile, exitCode });
 		});

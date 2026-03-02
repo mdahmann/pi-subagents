@@ -89,9 +89,28 @@ function ensureAccessibleDir(dirPath: string): void {
 	}
 }
 
-/** Delete async run directories older than maxAgeMs. These contain output-*.log files
- *  that can be 500MB+ each when using --mode json with thinking models. */
-function cleanupOldAsyncDirs(dir: string, maxAgeMs: number): void {
+const ASYNC_SUCCESS_RETENTION_MS = 2 * 60 * 60 * 1000; // 2h
+const ASYNC_FAILED_RETENTION_MS = 6 * 60 * 60 * 1000;  // 6h
+const ASYNC_UNKNOWN_RETENTION_MS = 24 * 60 * 60 * 1000; // 24h fallback
+
+function isPidAlive(pid: number | undefined): boolean {
+	if (!pid || !Number.isFinite(pid)) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Cleanup async run directories using state-aware retention:
+ * - complete: delete after 2h
+ * - failed: delete after 6h
+ * - running/queued: keep while process is alive
+ * - unknown/no status: delete after 24h
+ */
+function cleanupOldAsyncDirs(dir: string): void {
 	if (!fs.existsSync(dir)) return;
 	const now = Date.now();
 	let entries: string[];
@@ -100,7 +119,36 @@ function cleanupOldAsyncDirs(dir: string, maxAgeMs: number): void {
 		try {
 			const entryPath = path.join(dir, entry);
 			const stat = fs.statSync(entryPath);
-			if (stat.isDirectory() && now - stat.mtimeMs > maxAgeMs) {
+			if (!stat.isDirectory()) continue;
+
+			const status = readStatus(entryPath);
+			if (!status) {
+				if (now - stat.mtimeMs > ASYNC_UNKNOWN_RETENTION_MS) {
+					fs.rmSync(entryPath, { recursive: true, force: true });
+				}
+				continue;
+			}
+
+			const state = status.state;
+			const statusPid = (status as unknown as { pid?: number }).pid;
+			const statusTime = status.endedAt ?? status.lastUpdate ?? stat.mtimeMs;
+
+			if (state === "running" || state === "queued") {
+				if (isPidAlive(statusPid)) continue;
+				// Stale running/queued with dead pid: treat like failed and keep a bit for triage.
+				if (now - statusTime > ASYNC_FAILED_RETENTION_MS) {
+					fs.rmSync(entryPath, { recursive: true, force: true });
+				}
+				continue;
+			}
+
+			const ttl = state === "complete"
+				? ASYNC_SUCCESS_RETENTION_MS
+				: state === "failed"
+					? ASYNC_FAILED_RETENTION_MS
+					: ASYNC_UNKNOWN_RETENTION_MS;
+
+			if (now - statusTime > ttl) {
 				fs.rmSync(entryPath, { recursive: true, force: true });
 			}
 		} catch {}
@@ -149,9 +197,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	// Cleanup old chain directories on startup (after 24h)
 	cleanupOldChainDirs();
 
-	// Cleanup old async run directories on startup (after 24h)
+	// Cleanup old async run directories on startup (state-aware retention)
 	// These contain output-*.log files that can be 500MB+ each (--mode json thinking deltas)
-	cleanupOldAsyncDirs(ASYNC_DIR, 24 * 60 * 60 * 1000);
+	cleanupOldAsyncDirs(ASYNC_DIR);
 	// Cleanup old result files (after 7 days)
 	cleanupOldFiles(RESULTS_DIR, 7 * 24 * 60 * 60 * 1000);
 	// Cleanup orphaned ephemeral prompt dirs (after 24h)
@@ -165,9 +213,40 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	let baseCwd = process.cwd();
 	let currentSessionId: string | null = null;
 	const asyncJobs = new Map<string, AsyncJobState>();
-	const cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>(); // Track cleanup timeouts
+	const cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>(); // Widget cleanup timers
+	const asyncDirCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>(); // Disk cleanup timers
 	let lastUiContext: ExtensionContext | null = null;
 	let poller: NodeJS.Timeout | null = null;
+
+	const scheduleFinishedJobCleanup = (asyncId: string, status: "complete" | "failed", asyncDir?: string) => {
+		const existingUiTimer = cleanupTimers.get(asyncId);
+		if (existingUiTimer) clearTimeout(existingUiTimer);
+		const uiTimer = setTimeout(() => {
+			cleanupTimers.delete(asyncId);
+			asyncJobs.delete(asyncId);
+			if (lastUiContext) renderWidget(lastUiContext, Array.from(asyncJobs.values()));
+		}, 10000);
+		cleanupTimers.set(asyncId, uiTimer);
+
+		if (!asyncDir) return;
+		const existingDiskTimer = asyncDirCleanupTimers.get(asyncId);
+		if (existingDiskTimer) clearTimeout(existingDiskTimer);
+		const ttl = status === "complete" ? ASYNC_SUCCESS_RETENTION_MS : ASYNC_FAILED_RETENTION_MS;
+		const diskTimer = setTimeout(() => {
+			asyncDirCleanupTimers.delete(asyncId);
+			try {
+				const status = readStatus(asyncDir);
+				if (status && (status.state === "running" || status.state === "queued")) {
+					const pid = (status as unknown as { pid?: number }).pid;
+					if (isPidAlive(pid)) return;
+				}
+				if (fs.existsSync(asyncDir)) {
+					fs.rmSync(asyncDir, { recursive: true, force: true });
+				}
+			} catch {}
+		}, ttl);
+		asyncDirCleanupTimers.set(asyncId, diskTimer);
+	};
 
 	const ensurePoller = () => {
 		if (poller) return;
@@ -181,13 +260,35 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			}
 
 			for (const job of asyncJobs.values()) {
-				// Skip status reads for finished jobs - they won't change
+				// Finished jobs should be auto-removed from widget shortly, even if
+				// subagent:complete event was missed (e.g. hard kill/crash).
 				if (job.status === "complete" || job.status === "failed") {
+					if (!cleanupTimers.has(job.asyncId)) {
+						scheduleFinishedJobCleanup(job.asyncId, job.status, job.asyncDir);
+					}
 					continue;
 				}
+
 				const status = readStatus(job.asyncDir);
 				if (status) {
-					job.status = status.state;
+					let nextState = status.state;
+					const statusPid = (status as unknown as { pid?: number }).pid;
+					if ((nextState === "running" || nextState === "queued") && statusPid && !isPidAlive(statusPid)) {
+						nextState = "failed";
+						try {
+							const statusPath = path.join(job.asyncDir, "status.json");
+							const updated = {
+								...(status as unknown as Record<string, unknown>),
+								state: "failed",
+								endedAt: (status as unknown as { endedAt?: number }).endedAt ?? Date.now(),
+								lastUpdate: Date.now(),
+								error: (status as unknown as { error?: string }).error ?? `Process ${statusPid} died (detected by widget poller)`,
+							};
+							fs.writeFileSync(statusPath, JSON.stringify(updated, null, 2));
+						} catch {}
+					}
+
+					job.status = nextState;
 					job.mode = status.mode;
 					job.currentStep = status.currentStep ?? job.currentStep;
 					job.stepsTotal = status.steps?.length ?? job.stepsTotal;
@@ -229,6 +330,10 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				} else {
 					job.status = job.status === "queued" ? "running" : job.status;
 					job.updatedAt = Date.now();
+				}
+
+				if ((job.status === "complete" || job.status === "failed") && !cleanupTimers.has(job.asyncId)) {
+					scheduleFinishedJobCleanup(job.asyncId, job.status, job.asyncDir);
 				}
 			}
 
@@ -417,6 +522,15 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				};
 			}
 
+			// Derive parent session model string (provider/id) for model inheritance.
+			// When a subagent call omits `model:`, this is used as fallback before
+			// the agent's frontmatter default — so children inherit the parent's model.
+			const parentModel: string | undefined = (() => {
+				const m = ctx.model;
+				if (!m) return undefined;
+				return m.provider ? `${m.provider}/${m.id}` : m.id;
+			})();
+
 			// Validate chain early (before async/sync branching)
 			if (hasChain && params.chain) {
 				if (params.chain.length === 0) {
@@ -478,7 +592,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					};
 				}
 				const id = randomUUID();
-				const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: currentSessionId! };
+				const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: currentSessionId!, parentModel };
 
 				if (hasChain && params.chain) {
 					const normalized = normalizeSkillInput(params.skill);
@@ -567,7 +681,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						};
 					}
 					const id = randomUUID();
-					const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: currentSessionId! };
+					const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: currentSessionId!, parentModel };
 					return executeAsyncChain(id, {
 						chain: chainResult.requestedAsync.chain,
 						agents,
@@ -670,7 +784,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							};
 						}
 						const id = randomUUID();
-						const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: currentSessionId! };
+						const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: currentSessionId!, parentModel };
 						// Convert parallel tasks to a chain with a single parallel step
 						const parallelTasks = params.tasks!.map((t, i) => ({
 							agent: t.agent,
@@ -712,6 +826,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						artifactConfig,
 						maxOutput: params.maxOutput,
 						modelOverride: modelOverrides[i],
+						parentModel,
 						skills: effectiveSkills === false ? [] : effectiveSkills,
 						onUpdate: onUpdate
 							? (p) => {
@@ -849,7 +964,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							};
 						}
 						const id = randomUUID();
-						const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: currentSessionId! };
+						const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: currentSessionId!, parentModel };
 						return executeAsyncSingle(id, {
 							agent: params.agent!,
 							task,
@@ -889,6 +1004,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					maxOutput: params.maxOutput,
 					onUpdate,
 					modelOverride,
+					parentModel,
 					skills: effectiveSkills,
 				});
 				recordRun(params.agent!, cleanTask, r.exitCode, r.progressSummary?.durationMs ?? 0);
@@ -1236,7 +1352,8 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							return;
 						}
 						const id = randomUUID();
-						const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: ctx.sessionManager.getSessionId() ?? id };
+						const parentModelStr: string | undefined = (() => { const m = ctx.model; if (!m) return undefined; return m.provider ? `${m.provider}/${m.id}` : m.id; })();
+						const asyncCtx = { pi, cwd: ctx.cwd, currentSessionId: ctx.sessionManager.getSessionId() ?? id, parentModel: parentModelStr };
 						const sessionRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-session-"));
 						executeAsyncChain(id, {
 							chain: r.requestedAsync.chain,
@@ -1438,10 +1555,86 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 	});
 
 	pi.registerCommand("subagents", {
-		description: "Show all async subagent runs. Usage: /subagents [all]",
+		description: "Show async runs. Usage: /subagents [all] | /subagents clear",
 		handler: async (args, ctx) => {
-			const showAll = args.trim().toLowerCase() === "all";
+			const arg = args.trim().toLowerCase();
+			const showAll = arg === "all";
 			const MAX_RECENT = 30;
+
+			if (arg === "clear") {
+				let removed = 0;
+				let skippedActive = 0;
+				let skippedUnknown = 0;
+				let failed = 0;
+
+				try {
+					const dirs = fs.readdirSync(ASYNC_DIR).filter((d) => {
+						try { return fs.statSync(path.join(ASYNC_DIR, d)).isDirectory(); } catch { return false; }
+					});
+
+					for (const dir of dirs) {
+						const dirPath = path.join(ASYNC_DIR, dir);
+						const status = readStatus(dirPath);
+						if (!status) {
+							skippedUnknown++;
+							continue;
+						}
+
+						const state = status.state;
+						const pid = (status as unknown as { pid?: number }).pid;
+						const alive = isPidAlive(pid);
+						const active = (state === "running" || state === "queued") && alive;
+						if (active) {
+							skippedActive++;
+							continue;
+						}
+
+						const clearable = state === "complete" || state === "failed" || ((state === "running" || state === "queued") && !alive);
+						if (!clearable) {
+							skippedUnknown++;
+							continue;
+						}
+
+						try {
+							fs.rmSync(dirPath, { recursive: true, force: true });
+							removed++;
+							asyncJobs.delete(dir);
+
+							const uiTimer = cleanupTimers.get(dir);
+							if (uiTimer) {
+								clearTimeout(uiTimer);
+								cleanupTimers.delete(dir);
+							}
+							const diskTimer = asyncDirCleanupTimers.get(dir);
+							if (diskTimer) {
+								clearTimeout(diskTimer);
+								asyncDirCleanupTimers.delete(dir);
+							}
+
+							// Remove tiny async result summary file too
+							const resultFile = path.join(RESULTS_DIR, `${dir}.json`);
+							try {
+								if (fs.existsSync(resultFile)) fs.unlinkSync(resultFile);
+							} catch {}
+						} catch {
+							failed++;
+						}
+					}
+				} catch (e) {
+					ctx.ui.notify(`subagents clear failed: ${(e as Error).message}`, "error");
+					return;
+				}
+
+				if (lastUiContext) {
+					renderWidget(lastUiContext, Array.from(asyncJobs.values()));
+				}
+
+				ctx.ui.notify(
+					`Cleared ${removed} finished/failed runs. Skipped active: ${skippedActive}, unknown: ${skippedUnknown}${failed ? `, errors: ${failed}` : ""}`,
+					"info",
+				);
+				return;
+			}
 
 			// ── Collect jobs from memory + disk ──
 			const jobs: AsyncJobState[] = Array.from(asyncJobs.values());
@@ -1948,13 +2141,9 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		if (lastUiContext) {
 			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
 		}
-		// Schedule cleanup after 10 seconds (track timer for cleanup on shutdown)
-		const timer = setTimeout(() => {
-			cleanupTimers.delete(asyncId);
-			asyncJobs.delete(asyncId);
-			if (lastUiContext) renderWidget(lastUiContext, Array.from(asyncJobs.values()));
-		}, 10000);
-		cleanupTimers.set(asyncId, timer);
+
+		const finalStatus: "complete" | "failed" = result.success ? "complete" : "failed";
+		scheduleFinishedJobCleanup(asyncId, finalStatus, result.asyncDir ?? job?.asyncDir);
 	});
 
 	pi.on("tool_result", (event, ctx) => {
@@ -1980,6 +2169,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		baseCwd = ctx.cwd;
 		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		cleanupSessionArtifacts(ctx);
+		cleanupOldAsyncDirs(ASYNC_DIR);
 		for (const timer of cleanupTimers.values()) clearTimeout(timer);
 		cleanupTimers.clear();
 		asyncJobs.clear();
@@ -1993,6 +2183,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		baseCwd = ctx.cwd;
 		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		cleanupSessionArtifacts(ctx);
+		cleanupOldAsyncDirs(ASYNC_DIR);
 		for (const timer of cleanupTimers.values()) clearTimeout(timer);
 		cleanupTimers.clear();
 		asyncJobs.clear();
@@ -2006,6 +2197,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		baseCwd = ctx.cwd;
 		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		cleanupSessionArtifacts(ctx);
+		cleanupOldAsyncDirs(ASYNC_DIR);
 		for (const timer of cleanupTimers.values()) clearTimeout(timer);
 		cleanupTimers.clear();
 		asyncJobs.clear();
@@ -2026,6 +2218,10 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			clearTimeout(timer);
 		}
 		cleanupTimers.clear();
+		for (const timer of asyncDirCleanupTimers.values()) {
+			clearTimeout(timer);
+		}
+		asyncDirCleanupTimers.clear();
 		asyncJobs.clear();
 		resultFileCoalescer.clear();
 		if (lastUiContext?.hasUI) {

@@ -113,6 +113,13 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	} = params;
 	const chainSkills = chainSkillsParam ?? [];
 
+	// Derive parent model for inheritance (children without explicit model: get parent's model)
+	const parentModel: string | undefined = (() => {
+		const m = ctx.model;
+		if (!m) return undefined;
+		return m.provider ? `${m.provider}/${m.id}` : m.id;
+	})();
+
 	const allProgress: AgentProgress[] = [];
 	const allArtifactPaths: ArtifactPaths[] = [];
 
@@ -325,6 +332,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					const taskAgentConfig = agents.find((a) => a.name === task.agent);
 					const effectiveModel =
 						(task.model ? resolveModelFullId(task.model, availableModels) : null)
+						?? (parentModel ? resolveModelFullId(parentModel, availableModels) : null)
 						?? resolveModelFullId(taskAgentConfig?.model, availableModels);
 
 					const r = await runSync(ctx.cwd, agents, task.agent, taskStr, {
@@ -476,10 +484,11 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			// Assemble final task: prefix (READ/WRITE instructions) + task + suffix (progress, previous summary)
 			stepTask = prefix + stepTask + suffix;
 
-			// Resolve model: TUI override (already full format) or agent's model resolved to full format
+			// Resolve model: TUI override > step override > parent model > agent frontmatter
 			const effectiveModel =
 				tuiOverride?.model
 				?? (seqStep.model ? resolveModelFullId(seqStep.model, availableModels) : null)
+				?? (parentModel ? resolveModelFullId(parentModel, availableModels) : null)
 				?? resolveModelFullId(agentConfig.model, availableModels);
 
 			// Run step

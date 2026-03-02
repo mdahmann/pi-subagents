@@ -49,6 +49,8 @@ export interface AsyncExecutionContext {
 	pi: ExtensionAPI;
 	cwd: string;
 	currentSessionId: string;
+	/** Parent session model (provider/id format). Used as fallback when no explicit model override is provided. */
+	parentModel?: string;
 }
 
 export interface AsyncChainParams {
@@ -168,7 +170,7 @@ export function executeAsyncChain(
 			agent: s.agent,
 			task,
 			cwd: s.cwd,
-			model: applyThinkingSuffix(s.model ?? a.model, a.thinking),
+			model: applyThinkingSuffix(s.model ?? ctx.parentModel ?? a.model, a.thinking),
 			tools: a.tools,
 			extensions: a.extensions,
 			mcpDirectTools: a.mcpDirectTools,
@@ -276,7 +278,7 @@ export function executeAsyncSingle(
 	const runnerCwd = cwd ?? ctx.cwd;
 	const outputPath = resolveSingleOutputPath(params.output, ctx.cwd, cwd);
 	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
-	const effectiveModel = params.modelOverride ?? agentConfig.model;
+	const effectiveModel = params.modelOverride ?? ctx.parentModel ?? agentConfig.model;
 	const pid = spawnRunner(
 		{
 			id,

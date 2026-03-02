@@ -54,7 +54,7 @@ export async function runSync(
 	task: string,
 	options: RunSyncOptions,
 ): Promise<SingleResult> {
-	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, modelOverride } = options;
+	const { cwd, signal, onUpdate, maxOutput, artifactsDir, artifactConfig, runId, index, modelOverride, parentModel } = options;
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		return {
@@ -79,7 +79,7 @@ export async function runSync(
 		} catch {}
 		args.push("--session-dir", options.sessionDir);
 	}
-	const effectiveModel = modelOverride ?? agent.model;
+	const effectiveModel = modelOverride ?? parentModel ?? agent.model;
 	const modelArg = applyThinkingSuffix(effectiveModel, agent.thinking);
 	// Use --models (not --model) because pi CLI silently ignores --model
 	// without a companion --provider flag. --models resolves the provider
