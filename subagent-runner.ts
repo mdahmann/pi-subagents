@@ -196,9 +196,19 @@ function runPiStreaming(
 			lineBuf = lines.pop() ?? "";
 
 			for (const line of lines) {
+				// Drop extremely noisy JSONL event frames that can explode logs.
+				// - message_update: streaming thinking/token deltas
+				// - tool_execution_update: repeated progress frames that often duplicate huge args
+				// - turn_start/message_start: low-value metadata noise
+				if (line.startsWith("{") && (
+					line.includes('"message_update"') ||
+					line.includes('"tool_execution_update"') ||
+					line.includes('"turn_start"') ||
+					line.includes('"message_start"')
+				)) {
+					continue;
+				}
 				parseActivityLine(line);
-				// Skip huge incremental thinking deltas from persisted logs.
-				if (line.startsWith("{") && line.includes('"message_update"')) continue;
 				writeWithCap(`${line}\n`);
 			}
 		});
@@ -209,8 +219,14 @@ function runPiStreaming(
 
 		child.on("close", (exitCode) => {
 			if (lineBuf) {
-				parseActivityLine(lineBuf);
-				if (!(lineBuf.startsWith("{") && lineBuf.includes('"message_update"'))) {
+				const skipNoisy = lineBuf.startsWith("{") && (
+					lineBuf.includes('"message_update"') ||
+					lineBuf.includes('"tool_execution_update"') ||
+					lineBuf.includes('"turn_start"') ||
+					lineBuf.includes('"message_start"')
+				);
+				if (!skipNoisy) {
+					parseActivityLine(lineBuf);
 					writeWithCap(lineBuf);
 				}
 			}
@@ -520,8 +536,13 @@ async function runSingleStep(
 		});
 		for await (const line of rl) {
 			if (!line.startsWith("{")) continue;
-			// Skip message_update lines (can be 800KB+ with thinking deltas)
-			if (line.includes('"message_update"')) continue;
+			// Skip noisy incremental events to reduce parse overhead.
+			if (
+				line.includes('"message_update"') ||
+				line.includes('"tool_execution_update"') ||
+				line.includes('"turn_start"') ||
+				line.includes('"message_start"')
+			) continue;
 			try {
 				const evt = JSON.parse(line);
 				if (evt.type === "message_end" && evt.message?.role === "assistant") {
