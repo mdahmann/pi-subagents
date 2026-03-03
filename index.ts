@@ -9,7 +9,7 @@
  * Toggle: async parameter (default: false, configurable via config.json)
  *
  * Config file: ~/.pi/agent/extensions/subagent/config.json
- *   { "asyncByDefault": true }
+ *   { "asyncByDefault": true, "asyncLogNoisyEvents": false }
  */
 
 import { randomUUID } from "node:crypto";
@@ -207,6 +207,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	const config = loadConfig();
 	const asyncByDefault = config.asyncByDefault === true;
+	const asyncLogNoisyEvents =
+		config.asyncLogNoisyEvents === true || process.env.PI_SUBAGENT_LOG_NOISY_EVENTS === "1";
 
 	const tempArtifactsDir = getArtifactsDir(null);
 	cleanupAllArtifactDirs(DEFAULT_ARTIFACT_CONFIG.cleanupDays);
@@ -608,6 +610,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						shareEnabled,
 						sessionRoot,
 						chainSkills,
+						logNoisyEvents: asyncLogNoisyEvents,
 					});
 				}
 
@@ -641,6 +644,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						})(),
 						output: effectiveOutput,
 						modelOverride: params.model as string | undefined,
+						logNoisyEvents: asyncLogNoisyEvents,
 					});
 				}
 			}
@@ -693,6 +697,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						shareEnabled,
 						sessionRoot,
 						chainSkills: chainResult.requestedAsync.chainSkills,
+						logNoisyEvents: asyncLogNoisyEvents,
 					});
 				}
 
@@ -804,6 +809,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							shareEnabled,
 							sessionRoot,
 							chainSkills: [],
+							logNoisyEvents: asyncLogNoisyEvents,
 						});
 					}
 				}
@@ -979,6 +985,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							skills: skillOverride === false ? [] : skillOverride,
 							output: effectiveOutput,
 							modelOverride,
+							logNoisyEvents: asyncLogNoisyEvents,
 						});
 					}
 				}
@@ -1380,6 +1387,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							shareEnabled: false,
 							sessionRoot,
 							chainSkills: r.requestedAsync.chainSkills,
+							logNoisyEvents: asyncLogNoisyEvents,
 						}).then((asyncResult) => {
 							pi.sendUserMessage(asyncResult.content[0]?.text || "(launched in background)");
 						}).catch((err) => {

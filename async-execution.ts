@@ -64,6 +64,8 @@ export interface AsyncChainParams {
 	shareEnabled: boolean;
 	sessionRoot?: string;
 	chainSkills?: string[];
+	/** If true, keep noisy JSONL update frames in async logs for debugging. */
+	logNoisyEvents?: boolean;
 }
 
 export interface AsyncSingleParams {
@@ -80,6 +82,8 @@ export interface AsyncSingleParams {
 	skills?: string[];
 	output?: string | false;
 	modelOverride?: string;
+	/** If true, keep noisy JSONL update frames in async logs for debugging. */
+	logNoisyEvents?: boolean;
 }
 
 export interface AsyncExecutionResult {
@@ -98,7 +102,12 @@ export function isAsyncAvailable(): boolean {
 /**
  * Spawn the async runner process
  */
-function spawnRunner(cfg: object, suffix: string, cwd: string): number | undefined {
+function spawnRunner(
+	cfg: object,
+	suffix: string,
+	cwd: string,
+	extraEnv?: Record<string, string>,
+): number | undefined {
 	if (!jitiCliPath) return undefined;
 	
 	const cfgPath = path.join(os.tmpdir(), `pi-async-cfg-${suffix}.json`);
@@ -110,6 +119,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): number | undefin
 		detached: true,
 		stdio: "ignore",
 		windowsHide: true,
+		env: { ...process.env, ...extraEnv },
 	});
 	proc.unref();
 	return proc.pid;
@@ -201,6 +211,9 @@ export function executeAsyncChain(
 	});
 
 	const runnerCwd = cwd ?? ctx.cwd;
+	const runnerEnv: Record<string, string> = params.logNoisyEvents
+		? { PI_SUBAGENT_LOG_NOISY_EVENTS: "1" }
+		: {};
 	const pid = spawnRunner(
 		{
 			id,
@@ -219,6 +232,7 @@ export function executeAsyncChain(
 		},
 		id,
 		runnerCwd,
+		runnerEnv,
 	);
 
 	if (pid) {
@@ -279,6 +293,9 @@ export function executeAsyncSingle(
 	const outputPath = resolveSingleOutputPath(params.output, ctx.cwd, cwd);
 	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
 	const effectiveModel = params.modelOverride ?? ctx.parentModel ?? agentConfig.model;
+	const runnerEnv: Record<string, string> = params.logNoisyEvents
+		? { PI_SUBAGENT_LOG_NOISY_EVENTS: "1" }
+		: {};
 	const pid = spawnRunner(
 		{
 			id,
@@ -310,6 +327,7 @@ export function executeAsyncSingle(
 		},
 		id,
 		runnerCwd,
+		runnerEnv,
 	);
 
 	if (pid) {

@@ -704,6 +704,29 @@ subagent_status({ id: "<id>" })
 subagent_status({ dir: "<tmpdir>/pi-async-subagent-runs/<id>" })
 ```
 
+### Debug mode: keep noisy JSONL updates
+
+By default, async logs suppress noisy event frames (`message_update`, `tool_execution_update`,
+`turn_start`, `message_start`) to prevent huge `output-*.log` growth.
+
+Enable full noisy event logging only when debugging:
+
+```bash
+export PI_SUBAGENT_LOG_NOISY_EVENTS=1
+```
+
+Or set extension config (`~/.pi/agent/extensions/subagent/config.json`):
+
+```json
+{
+  "asyncByDefault": false,
+  "asyncLogNoisyEvents": true
+}
+```
+
+When debug mode is off (default), logs stay compact while preserving step starts/ends,
+assistant final outputs, and status telemetry.
+
 ## Events
 
 Async events:

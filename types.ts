@@ -230,6 +230,8 @@ export interface RunSyncOptions {
 
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
+	/** Keep noisy JSONL update events in async logs (debug mode). Default false. */
+	asyncLogNoisyEvents?: boolean;
 }
 
 // ============================================================================
