@@ -143,22 +143,26 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 		const id = job.asyncId.slice(0, 6);
 		const agentLabel = job.agents ? job.agents.join(" → ") : (job.mode ?? "single");
 
-		// Activity uses output mtime first, with status heartbeat fallback.
-		// This keeps "last active" useful even when noisy JSONL events are suppressed.
+		// Activity uses output mtime for dead-process detection + heartbeat for stable recency.
+		// Keep text compact to avoid truncation/flicker in narrow widget widths.
 		let activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
 		if (activityText === "DEAD") {
 			activityText = "";
 			job.status = "failed";
 		}
-		if (job.status === "running" && (!activityText || activityText.startsWith("active ")) && job.updatedAt) {
-			const heartbeatAgo = Date.now() - job.updatedAt;
-			if (heartbeatAgo < 1000) activityText = "heartbeat now";
-			else if (heartbeatAgo < 60000) activityText = `heartbeat ${Math.floor(heartbeatAgo / 1000)}s ago`;
-			else activityText = `heartbeat ${Math.floor(heartbeatAgo / 60000)}m ago`;
-		}
-		if (job.status === "running" && (job.activeChildren ?? 0) > 0) {
-			const childTxt = `${job.activeChildren} child${job.activeChildren === 1 ? "" : "ren"}`;
-			activityText = activityText ? `${activityText}, ${childTxt}` : childTxt;
+		const activityParts: string[] = [];
+		if (job.status === "running") {
+			if (job.updatedAt) {
+				const heartbeatAgo = Date.now() - job.updatedAt;
+				if (heartbeatAgo < 1000) activityParts.push("hb now");
+				else if (heartbeatAgo < 60000) activityParts.push(`hb ${Math.floor(heartbeatAgo / 1000)}s`);
+				else activityParts.push(`hb ${Math.floor(heartbeatAgo / 60000)}m`);
+			} else if (activityText) {
+				activityParts.push(activityText.replace(/^active\s+/, "act "));
+			}
+			if ((job.activeChildren ?? 0) > 0) {
+				activityParts.push(`sub:${job.activeChildren}`);
+			}
 		}
 
 		const status =
@@ -170,7 +174,7 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 
 		const endTime = (job.status === "complete" || job.status === "failed") ? (job.updatedAt ?? Date.now()) : Date.now();
 		const elapsed = job.startedAt ? formatDuration(endTime - job.startedAt) : "";
-		const activitySuffix = activityText ? ` | ${activityText}` : "";
+		const activitySuffix = activityParts.length ? ` | ${activityParts.join(" · ")}` : "";
 
 		lines.push(truncLine(`- ${id} ${status} | ${agentLabel}${elapsed ? ` | ${elapsed}` : ""}${activitySuffix}`, w));
 	}
