@@ -93,6 +93,7 @@ export const SubagentParams = Type.Object({
 	output: Type.Optional(Type.Any({ description: "Override output file for single agent (string), or false to disable (uses agent default if omitted). Absolute paths are used as-is; relative paths resolve against cwd." })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')" })),
+	debugNoisyEvents: Type.Optional(Type.Boolean({ description: "Async mode only: include noisy JSONL update events in runner logs for debugging (default: false)." })),
 });
 
 export const StatusParams = Type.Object({

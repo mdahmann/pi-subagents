@@ -533,6 +533,7 @@ Notes:
 | `clarify` | boolean | true (chains) | Show TUI to preview/edit chain; implies sync mode |
 | `agentScope` | `"user" \| "project" \| "both"` | `both` | Agent discovery scope (project wins on name collisions) |
 | `async` | boolean | false | Background execution (requires `clarify: false` for chains) |
+| `debugNoisyEvents` | boolean | false | Async only: include noisy JSONL update events in runner logs for debugging |
 | `cwd` | string | - | Override working directory |
 | `maxOutput` | `{bytes?, lines?}` | 200KB, 5000 lines | Truncation limits for final output |
 | `artifacts` | boolean | true | Write debug artifacts |

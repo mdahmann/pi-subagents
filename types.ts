@@ -184,6 +184,8 @@ export interface AsyncJobState {
 	liveCost?: number;
 	/** Tool call count from status.json steps */
 	toolCount?: number;
+	/** Active child subagent/pi processes from runner heartbeat */
+	activeChildren?: number;
 }
 
 // ============================================================================

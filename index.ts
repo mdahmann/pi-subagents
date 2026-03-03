@@ -313,6 +313,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 						}
 						job.currentTool = activeStep?.currentTool as string | undefined;
 						job.currentToolArgs = activeStep?.currentToolArgs as string | undefined;
+						job.activeChildren = typeof activeStep?.activeChildren === "number"
+							? (activeStep.activeChildren as number)
+							: undefined;
 
 						// Model + cost + tool count from all steps
 						const models: string[] = [];
@@ -502,6 +505,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					? params.clarify === false    // chains: only async if TUI explicitly disabled
 					: params.clarify !== true     // single: async unless TUI explicitly enabled
 			);
+			const runLogNoisyEvents = params.debugNoisyEvents ?? asyncLogNoisyEvents;
 
 			const artifactConfig: ArtifactConfig = {
 				...DEFAULT_ARTIFACT_CONFIG,
@@ -610,7 +614,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						shareEnabled,
 						sessionRoot,
 						chainSkills,
-						logNoisyEvents: asyncLogNoisyEvents,
+						logNoisyEvents: runLogNoisyEvents,
 					});
 				}
 
@@ -644,7 +648,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						})(),
 						output: effectiveOutput,
 						modelOverride: params.model as string | undefined,
-						logNoisyEvents: asyncLogNoisyEvents,
+						logNoisyEvents: runLogNoisyEvents,
 					});
 				}
 			}
@@ -697,7 +701,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						shareEnabled,
 						sessionRoot,
 						chainSkills: chainResult.requestedAsync.chainSkills,
-						logNoisyEvents: asyncLogNoisyEvents,
+						logNoisyEvents: runLogNoisyEvents,
 					});
 				}
 
@@ -809,7 +813,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							shareEnabled,
 							sessionRoot,
 							chainSkills: [],
-							logNoisyEvents: asyncLogNoisyEvents,
+							logNoisyEvents: runLogNoisyEvents,
 						});
 					}
 				}
@@ -985,7 +989,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							skills: skillOverride === false ? [] : skillOverride,
 							output: effectiveOutput,
 							modelOverride,
-							logNoisyEvents: asyncLogNoisyEvents,
+							logNoisyEvents: runLogNoisyEvents,
 						});
 					}
 				}

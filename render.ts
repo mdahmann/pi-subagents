@@ -143,13 +143,22 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 		const id = job.asyncId.slice(0, 6);
 		const agentLabel = job.agents ? job.agents.join(" → ") : (job.mode ?? "single");
 
-		// "active Xs ago" from heartbeat/output file mtime
-		// Also detects dead processes and auto-updates status.json
+		// Activity uses output mtime first, with status heartbeat fallback.
+		// This keeps "last active" useful even when noisy JSONL events are suppressed.
 		let activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
-		// If getLastActivity detected a dead process, update the job status for display
 		if (activityText === "DEAD") {
 			activityText = "";
 			job.status = "failed";
+		}
+		if (job.status === "running" && (!activityText || activityText.startsWith("active ")) && job.updatedAt) {
+			const heartbeatAgo = Date.now() - job.updatedAt;
+			if (heartbeatAgo < 1000) activityText = "heartbeat now";
+			else if (heartbeatAgo < 60000) activityText = `heartbeat ${Math.floor(heartbeatAgo / 1000)}s ago`;
+			else activityText = `heartbeat ${Math.floor(heartbeatAgo / 60000)}m ago`;
+		}
+		if (job.status === "running" && (job.activeChildren ?? 0) > 0) {
+			const childTxt = `${job.activeChildren} child${job.activeChildren === 1 ? "" : "ren"}`;
+			activityText = activityText ? `${activityText}, ${childTxt}` : childTxt;
 		}
 
 		const status =
