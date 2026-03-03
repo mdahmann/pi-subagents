@@ -98,4 +98,7 @@ export const SubagentParams = Type.Object({
 export const StatusParams = Type.Object({
 	id: Type.Optional(Type.String({ description: "Async run id or prefix" })),
 	dir: Type.Optional(Type.String({ description: "Async run directory (overrides id search)" })),
+	tailLines: Type.Optional(Type.Number({ description: "Tail lines per output log in failure triage (default: 10, max: 50)" })),
+	tailLineMaxChars: Type.Optional(Type.Number({ description: "Max chars per tail line in failure triage (default: 240, max: 1000)" })),
+	includeFailureTriage: Type.Optional(Type.Boolean({ description: "Include failure triage section for failed runs (default: true). Set false for short status." })),
 });

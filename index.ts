@@ -41,7 +41,7 @@ import {
 	WIDGET_KEY,
 	checkSubagentDepth,
 } from "./types.js";
-import { readStatus, findByPrefix, getFinalOutput, mapConcurrent, getLastActivity } from "./utils.js";
+import { readStatus, findByPrefix, getFinalOutput, getOutputTail, mapConcurrent, getLastActivity } from "./utils.js";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.js";
 import { createFileCoalescer } from "./file-coalescer.js";
 import { runSync } from "./execution.js";
@@ -1136,6 +1136,9 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					const elapsed = status.endedAt
 						? `${((status.endedAt - status.startedAt) / 1000).toFixed(0)}s`
 						: `${((Date.now() - status.startedAt) / 1000).toFixed(0)}s (running)`;
+					const tailLines = Math.max(1, Math.min(50, Math.floor(params.tailLines ?? 10)));
+					const tailLineMaxChars = Math.max(80, Math.min(1000, Math.floor(params.tailLineMaxChars ?? 240)));
+					const includeFailureTriage = params.includeFailureTriage !== false;
 
 					const lines = [
 						`Run: ${status.runId}`,
@@ -1165,44 +1168,56 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							const toolCount = s.toolCount ? `${s.toolCount} calls` : "";
 							const info = [dur, tok, cost, outSize, children, toolInfo, toolCount].filter(Boolean).join(", ");
 							lines.push(`  ${i + 1}. ${s.agent}${modelTag}: ${s.status}${info ? ` (${info})` : ""}`);
-							if (s.error) lines.push(`     ⚠️ ${s.error}`);
+							if (s.error) {
+								const shortStepError = s.error.length > 400 ? `${s.error.slice(0, 397)}…` : s.error;
+								lines.push(`     ⚠️ ${shortStepError}`);
+							}
 						}
 					}
 
 					// Quick failure triage for failed runs
 					if (status.state === "failed" || status.error) {
-						lines.push("", "--- Failure Triage ---");
-						// Check all output logs (output-0.log, output-1.log, etc.)
-						const outputFiles = fs.readdirSync(asyncDir).filter((f: string) => f.match(/^output-\d+\.log$/)).sort();
-						for (const of2 of outputFiles) {
-							const outputLogPath = path.join(asyncDir, of2);
-							const logSize = fs.statSync(outputLogPath).size;
-							if (logSize === 0) {
-								lines.push(`⚠️ ${of2}: BLANK — likely provider 429/quota/auth error.`);
-							} else {
-								const logContent = fs.readFileSync(outputLogPath, "utf-8");
-								const logLines = logContent.split("\n");
-								// Pattern-match known failures
-								const has429 = logLines.some((l: string) => /429|rate.limit|quota.*exceed|resource.*exhaust/i.test(l));
-								const hasAuth = logLines.some((l: string) => /401|403|auth.*fail|invalid.*key|unauthorized/i.test(l));
-								const hasTimeout = logLines.some((l: string) => /timeout|timed.out|ETIMEDOUT/i.test(l));
-								const hasOOM = logLines.some((l: string) => /heap|memory|ENOMEM|killed/i.test(l));
-								if (has429) lines.push(`⚠️ ${of2}: PROVIDER QUOTA/RATE LIMIT (429) — cool down or switch model.`);
-								else if (hasAuth) lines.push(`⚠️ ${of2}: AUTH ERROR — check API key / credentials.`);
-								else if (hasTimeout) lines.push(`⚠️ ${of2}: TIMEOUT — request took too long.`);
-								else if (hasOOM) lines.push(`⚠️ ${of2}: MEMORY — process killed or OOM.`);
-								// Tail last 8 lines
-								const tail = logLines.slice(-8).join("\n").trim();
-								if (tail) {
-									lines.push(`${of2} tail (${(logSize / 1024).toFixed(0)}KB):`);
-									lines.push(tail);
+						if (includeFailureTriage) {
+							lines.push("", "--- Failure Triage ---");
+							// Check all output logs (output-0.log, output-1.log, etc.)
+							const outputFiles = fs.readdirSync(asyncDir).filter((f: string) => f.match(/^output-\d+\.log$/)).sort();
+							for (const of2 of outputFiles) {
+								const outputLogPath = path.join(asyncDir, of2);
+								const logSize = fs.statSync(outputLogPath).size;
+								if (logSize === 0) {
+									lines.push(`⚠️ ${of2}: BLANK — likely provider 429/quota/auth error.`);
+								} else {
+									const tail = getOutputTail(outputLogPath, tailLines, tailLineMaxChars);
+									const tailText = tail.join("\n");
+									// Pattern-match known failures from recent tail only (safe + bounded)
+									const has429 = /429|rate.limit|quota.*exceed|resource.*exhaust/i.test(tailText);
+									const hasAuth = /401|403|auth.*fail|invalid.*key|unauthorized/i.test(tailText);
+									const hasTimeout = /timeout|timed.out|ETIMEDOUT/i.test(tailText);
+									const hasOOM = /heap|memory|ENOMEM|killed/i.test(tailText);
+									if (has429) lines.push(`⚠️ ${of2}: PROVIDER QUOTA/RATE LIMIT (429) — cool down or switch model.`);
+									else if (hasAuth) lines.push(`⚠️ ${of2}: AUTH ERROR — check API key / credentials.`);
+									else if (hasTimeout) lines.push(`⚠️ ${of2}: TIMEOUT — request took too long.`);
+									else if (hasOOM) lines.push(`⚠️ ${of2}: MEMORY — process killed or OOM.`);
+
+									if (tail.length > 0) {
+										lines.push(`${of2} tail(last ${tail.length}, ${(logSize / 1024).toFixed(0)}KB):`);
+										for (const line of tail) {
+											lines.push(`  ${line}`);
+										}
+									}
 								}
 							}
+							if (outputFiles.length === 0) {
+								lines.push("⚠️ No output logs found — process may not have started.");
+							}
+							lines.push(`(Tip: set includeFailureTriage=false for short status; tailLines=${tailLines})`);
+						} else {
+							lines.push("", "--- Failure Triage ---", "(disabled; pass includeFailureTriage=true to include log tails)");
 						}
-						if (outputFiles.length === 0) {
-							lines.push("⚠️ No output logs found — process may not have started.");
+						if (status.error) {
+							const shortStatusError = status.error.length > 600 ? `${status.error.slice(0, 597)}…` : status.error;
+							lines.push(`Error: ${shortStatusError}`);
 						}
-						if (status.error) lines.push(`Error: ${status.error}`);
 					}
 
 					if (status.totalTokens) {

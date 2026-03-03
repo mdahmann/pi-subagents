@@ -50,9 +50,9 @@ const outputTailCache = new Map<string, { mtime: number; size: number; lines: st
  * Extract human-readable text from JSONL event lines.
  * Filters out raw JSON, extracts text deltas and tool activity.
  */
-function extractReadableLines(rawLines: string[]): string[] {
+function extractReadableLines(rawLines: string[], maxReadableLines: number = 10): string[] {
 	const readable: string[] = [];
-	for (let i = rawLines.length - 1; i >= 0 && readable.length < 10; i--) {
+	for (let i = rawLines.length - 1; i >= 0 && readable.length < maxReadableLines; i--) {
 		const line = rawLines[i].trim();
 		if (!line) continue;
 
@@ -100,17 +100,20 @@ function extractReadableLines(rawLines: string[]): string[] {
 	return readable;
 }
 
-export function getOutputTail(outputFile: string | undefined, maxLines: number = 3): string[] {
+export function getOutputTail(outputFile: string | undefined, maxLines: number = 3, maxLineChars: number = 120): string[] {
 	if (!outputFile) return [];
 	let fd: number | null = null;
 	try {
 		const stat = fs.statSync(outputFile);
 		if (stat.size === 0) return [];
 
+		const safeMaxLines = Math.max(1, Math.min(200, Math.floor(maxLines || 3)));
+		const safeMaxChars = Math.max(40, Math.min(4000, Math.floor(maxLineChars || 120)));
+
 		// Check cache using both mtime and size (size changes more frequently during writes)
 		const cached = outputTailCache.get(outputFile);
 		if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
-			return cached.lines;
+			return cached.lines.slice(-safeMaxLines).map((l) => l.slice(0, safeMaxChars) + (l.length > safeMaxChars ? "…" : ""));
 		}
 
 		const tailBytes = 8192; // Read more to find readable content in JSONL streams
@@ -122,11 +125,11 @@ export function getOutputTail(outputFile: string | undefined, maxLines: number =
 		const allLines = content.split("\n").filter((l) => l.trim());
 
 		// Extract readable content from JSONL events (or pass through plain text)
-		const readable = extractReadableLines(allLines);
-		const lines = readable.slice(-maxLines).map((l) => l.slice(0, 120) + (l.length > 120 ? "…" : ""));
+		const readable = extractReadableLines(allLines, safeMaxLines);
+		const lines = readable.slice(-safeMaxLines).map((l) => l.slice(0, safeMaxChars) + (l.length > safeMaxChars ? "…" : ""));
 
 		// Cache the result
-		outputTailCache.set(outputFile, { mtime: stat.mtimeMs, size: stat.size, lines });
+		outputTailCache.set(outputFile, { mtime: stat.mtimeMs, size: stat.size, lines: readable });
 		// Limit cache size
 		if (outputTailCache.size > 20) {
 			const firstKey = outputTailCache.keys().next().value;
