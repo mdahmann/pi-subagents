@@ -263,10 +263,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		if (poller) return;
 		poller = setInterval(() => {
 			if (!lastUiContext || !lastUiContext.hasUI) return;
+			// Keep widget source aligned with /subagents overlay by continuously
+			// pulling jobs from disk status files.
+			rehydrateAsyncJobsFromDisk();
 			if (asyncJobs.size === 0) {
 				renderWidget(lastUiContext, []);
-				clearInterval(poller);
-				poller = null;
 				return;
 			}
 
@@ -2348,7 +2349,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
 			renderWidget(ctx, Array.from(asyncJobs.values()));
-			if (asyncJobs.size > 0) ensurePoller();
+			ensurePoller();
 		}
 	});
 	pi.on("session_switch", (_event, ctx) => {
@@ -2364,7 +2365,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
 			renderWidget(ctx, Array.from(asyncJobs.values()));
-			if (asyncJobs.size > 0) ensurePoller();
+			ensurePoller();
 		}
 	});
 	pi.on("session_branch", (_event, ctx) => {
@@ -2380,7 +2381,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
 			renderWidget(ctx, Array.from(asyncJobs.values()));
-			if (asyncJobs.size > 0) ensurePoller();
+			ensurePoller();
 		}
 	});
 	pi.on("session_shutdown", () => {

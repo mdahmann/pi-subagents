@@ -12,7 +12,7 @@ import {
 	WIDGET_KEY,
 } from "./types.js";
 import { formatTokens, formatUsage, formatDuration, formatToolCall, shortenPath } from "./formatters.js";
-import { getFinalOutput, getDisplayItems, getOutputTail, getLastActivity } from "./utils.js";
+import { getFinalOutput, getDisplayItems, getOutputTail } from "./utils.js";
 
 type Theme = ExtensionContext["ui"]["theme"];
 
@@ -88,8 +88,8 @@ function truncLine(text: string, maxWidth: number): string {
 // Track last rendered widget state to avoid no-op re-renders
 let lastWidgetHash = "";
 let lastWidgetRenderAt = 0;
+let focusedRunningAsyncId: string | undefined;
 const WIDGET_MIN_RENDER_MS = 900;
-const MAX_HEARTBEAT_SNIPPETS = 3;
 
 /**
  * Compute a simple hash of job states for change detection
@@ -141,6 +141,7 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 			lastWidgetRenderAt = 0;
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 		}
+		focusedRunningAsyncId = undefined;
 		ctx.ui.setStatus("subagents", undefined);
 		return;
 	}
@@ -163,28 +164,23 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 	const w = getTermWidth();
 	const lines: string[] = [];
 	const resolved = jobs.map((job) => {
-		const activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
-		const status = activityText === "DEAD" ? "failed" : job.status;
 		return {
 			job,
-			status,
+			status: job.status,
 			id: job.asyncId.slice(0, 6),
 			agentLabel: job.agents ? job.agents.join(" → ") : (job.mode ?? "single"),
-			activityText,
 			updatedAt: job.updatedAt ?? job.startedAt ?? 0,
 		};
 	});
 
 	const counts = {
-		running: resolved.filter((item) => item.status === "running").length,
-		queued: resolved.filter((item) => item.status === "queued").length,
+		active: resolved.filter((item) => item.status === "running" || item.status === "queued").length,
 		done: resolved.filter((item) => item.status === "complete").length,
 		failed: resolved.filter((item) => item.status === "failed").length,
 	};
 
 	const countParts: string[] = [];
-	if (counts.running > 0) countParts.push(theme.fg("warning", `${counts.running} running`));
-	if (counts.queued > 0) countParts.push(theme.fg("accent", `${counts.queued} queued`));
+	if (counts.active > 0) countParts.push(theme.fg("warning", `${counts.active} active`));
 	if (counts.done > 0) countParts.push(theme.fg("success", `${counts.done} done`));
 	if (counts.failed > 0) countParts.push(theme.fg("error", `${counts.failed} failed`));
 	if (countParts.length === 0) countParts.push(theme.fg("dim", "idle"));
@@ -195,19 +191,29 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 	);
 	lines.push(line1);
 
-	const runningSnippets = resolved
-		.filter((item) => item.status === "running" || item.status === "queued")
-		.sort((a, b) => b.updatedAt - a.updatedAt)
-		.slice(0, MAX_HEARTBEAT_SNIPPETS)
-		.map((item) => {
-			const updatedAt = item.job.updatedAt ?? item.updatedAt;
-			const ago = formatAgoShort(now - updatedAt);
-			return `${theme.fg("dim", item.id)} ${shortenAgentLabel(item.agentLabel)} ${theme.fg("muted", `(${ago})`)}`;
-		});
+	const runningItems = resolved
+		.filter((item) => item.status === "running" || item.status === "queued");
+
+	if (runningItems.length === 0) {
+		focusedRunningAsyncId = undefined;
+	} else if (!focusedRunningAsyncId || !runningItems.some((item) => item.job.asyncId === focusedRunningAsyncId)) {
+		const preferred = runningItems
+			.slice()
+			.sort((a, b) => {
+				const aStart = a.job.startedAt ?? a.updatedAt;
+				const bStart = b.job.startedAt ?? b.updatedAt;
+				if (bStart !== aStart) return bStart - aStart;
+				return a.job.asyncId.localeCompare(b.job.asyncId);
+			})[0];
+		focusedRunningAsyncId = preferred?.job.asyncId;
+	}
 
 	let line2: string;
-	if (runningSnippets.length > 0) {
-		line2 = runningSnippets.join(theme.fg("dim", "  |  "));
+	if (runningItems.length > 0) {
+		const focused = runningItems.find((item) => item.job.asyncId === focusedRunningAsyncId) ?? runningItems[0];
+		const updatedAt = focused.job.updatedAt ?? focused.updatedAt;
+		const ago = formatAgoShort(now - updatedAt);
+		line2 = `${theme.fg("dim", focused.id)} ${shortenAgentLabel(focused.agentLabel)} ${theme.fg("muted", `(${ago})`)}`;
 	} else {
 		const lastFinished = resolved
 			.filter((item) => item.status === "complete" || item.status === "failed")
