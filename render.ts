@@ -220,13 +220,6 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 	}
 	lines.push(truncLine(line2, w));
 
-	const footerStatusParts: string[] = [];
-	if (counts.running > 0) footerStatusParts.push(`${counts.running}r`);
-	if (counts.queued > 0) footerStatusParts.push(`${counts.queued}q`);
-	if (counts.done > 0) footerStatusParts.push(`${counts.done}d`);
-	if (counts.failed > 0) footerStatusParts.push(`${counts.failed}f`);
-	ctx.ui.setStatus("subagents", footerStatusParts.length > 0 ? `sub:${footerStatusParts.join("/")}` : undefined);
-
 	ctx.ui.setWidget(WIDGET_KEY, lines);
 }
 
