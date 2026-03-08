@@ -22,6 +22,7 @@ function getTermWidth(): number {
 
 // Grapheme segmenter for proper Unicode handling (shared instance)
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const AGENT_LABEL_MAX_CHARS = 18;
 
 /**
  * Truncate a line to maxWidth, preserving ANSI styling through the ellipsis.
@@ -86,14 +87,32 @@ function truncLine(text: string, maxWidth: number): string {
 
 // Track last rendered widget state to avoid no-op re-renders
 let lastWidgetHash = "";
+let lastWidgetRenderAt = 0;
+const WIDGET_MIN_RENDER_MS = 900;
+const MAX_HEARTBEAT_SNIPPETS = 3;
 
 /**
  * Compute a simple hash of job states for change detection
  */
 function computeWidgetHash(jobs: AsyncJobState[]): string {
-	return jobs.slice(0, MAX_WIDGET_JOBS).map(job =>
+	const sample = jobs.slice(0, MAX_WIDGET_JOBS).map(job =>
 		`${job.asyncId}:${job.status}:${job.currentStep}:${job.updatedAt}:${job.totalTokens?.total ?? 0}`
 	).join("|");
+	return `${jobs.length}|${sample}`;
+}
+
+function formatAgoShort(msAgo: number): string {
+	if (!Number.isFinite(msAgo) || msAgo < 0) return "?";
+	if (msAgo < 1000) return "now";
+	if (msAgo < 60000) return `${Math.floor(msAgo / 1000)}s`;
+	if (msAgo < 3600000) return `${Math.floor(msAgo / 60000)}m`;
+	return `${Math.floor(msAgo / 3600000)}h`;
+}
+
+function shortenAgentLabel(label: string): string {
+	const trimmed = label.trim();
+	if (trimmed.length <= AGENT_LABEL_MAX_CHARS) return trimmed;
+	return `${trimmed.slice(0, AGENT_LABEL_MAX_CHARS - 1)}…`;
 }
 
 function extractOutputTarget(task: string): string | undefined {
@@ -119,65 +138,94 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 	if (jobs.length === 0) {
 		if (lastWidgetHash !== "") {
 			lastWidgetHash = "";
+			lastWidgetRenderAt = 0;
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 		}
+		ctx.ui.setStatus("subagents", undefined);
 		return;
 	}
 
 	// Check if anything changed since last render
-	// Always re-render if any displayed job is running (output tail updates constantly)
+	const now = Date.now();
 	const displayedJobs = jobs.slice(0, MAX_WIDGET_JOBS);
-	const hasRunningJobs = displayedJobs.some(job => job.status === "running");
+	const hasRunningJobs = displayedJobs.some(job => job.status === "running" || job.status === "queued");
 	const newHash = computeWidgetHash(jobs);
 	if (!hasRunningJobs && newHash === lastWidgetHash) {
-		return; // Skip re-render, nothing changed
+		return;
+	}
+	if (hasRunningJobs && newHash === lastWidgetHash && (now - lastWidgetRenderAt) < WIDGET_MIN_RENDER_MS) {
+		return;
 	}
 	lastWidgetHash = newHash;
+	lastWidgetRenderAt = now;
 
 	const theme = ctx.ui.theme;
 	const w = getTermWidth();
 	const lines: string[] = [];
-	lines.push(theme.fg("accent", "Async subagents"));
+	const resolved = jobs.map((job) => {
+		const activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
+		const status = activityText === "DEAD" ? "failed" : job.status;
+		return {
+			job,
+			status,
+			id: job.asyncId.slice(0, 6),
+			agentLabel: job.agents ? job.agents.join(" → ") : (job.mode ?? "single"),
+			activityText,
+			updatedAt: job.updatedAt ?? job.startedAt ?? 0,
+		};
+	});
 
-	for (const job of displayedJobs) {
-		const id = job.asyncId.slice(0, 6);
-		const agentLabel = job.agents ? job.agents.join(" → ") : (job.mode ?? "single");
+	const counts = {
+		running: resolved.filter((item) => item.status === "running").length,
+		queued: resolved.filter((item) => item.status === "queued").length,
+		done: resolved.filter((item) => item.status === "complete").length,
+		failed: resolved.filter((item) => item.status === "failed").length,
+	};
 
-		// Activity uses output mtime for dead-process detection + heartbeat for stable recency.
-		// Keep text compact to avoid truncation/flicker in narrow widget widths.
-		let activityText = job.status === "running" ? getLastActivity(job.outputFile) : "";
-		if (activityText === "DEAD") {
-			activityText = "";
-			job.status = "failed";
+	const countParts: string[] = [];
+	if (counts.running > 0) countParts.push(theme.fg("warning", `${counts.running} running`));
+	if (counts.queued > 0) countParts.push(theme.fg("accent", `${counts.queued} queued`));
+	if (counts.done > 0) countParts.push(theme.fg("success", `${counts.done} done`));
+	if (counts.failed > 0) countParts.push(theme.fg("error", `${counts.failed} failed`));
+	if (countParts.length === 0) countParts.push(theme.fg("dim", "idle"));
+
+	const line1 = truncLine(
+		`${theme.fg("accent", "Async subagents")} (${jobs.length}): ${countParts.join(theme.fg("dim", " · "))}`,
+		w,
+	);
+	lines.push(line1);
+
+	const runningSnippets = resolved
+		.filter((item) => item.status === "running" || item.status === "queued")
+		.sort((a, b) => b.updatedAt - a.updatedAt)
+		.slice(0, MAX_HEARTBEAT_SNIPPETS)
+		.map((item) => {
+			const updatedAt = item.job.updatedAt ?? item.updatedAt;
+			const ago = formatAgoShort(now - updatedAt);
+			return `${theme.fg("dim", item.id)} ${shortenAgentLabel(item.agentLabel)} ${theme.fg("muted", `(${ago})`)}`;
+		});
+
+	let line2: string;
+	if (runningSnippets.length > 0) {
+		line2 = runningSnippets.join(theme.fg("dim", "  |  "));
+	} else {
+		const lastFinished = resolved
+			.filter((item) => item.status === "complete" || item.status === "failed")
+			.sort((a, b) => b.updatedAt - a.updatedAt)[0];
+		if (lastFinished) {
+			line2 = `${theme.fg("dim", lastFinished.id)} ${shortenAgentLabel(lastFinished.agentLabel)} ${theme.fg("muted", `(${formatAgoShort(now - lastFinished.updatedAt)})`)}`;
+		} else {
+			line2 = theme.fg("dim", "none");
 		}
-		const activityParts: string[] = [];
-		if (job.status === "running") {
-			if (job.updatedAt) {
-				const heartbeatAgo = Date.now() - job.updatedAt;
-				if (heartbeatAgo < 1000) activityParts.push("hb now");
-				else if (heartbeatAgo < 60000) activityParts.push(`hb ${Math.floor(heartbeatAgo / 1000)}s`);
-				else activityParts.push(`hb ${Math.floor(heartbeatAgo / 60000)}m`);
-			} else if (activityText) {
-				activityParts.push(activityText.replace(/^active\s+/, "act "));
-			}
-			if ((job.activeChildren ?? 0) > 0) {
-				activityParts.push(`sub:${job.activeChildren}`);
-			}
-		}
-
-		const status =
-			job.status === "complete"
-				? theme.fg("success", "complete")
-				: job.status === "failed"
-					? theme.fg("error", "failed")
-					: theme.fg("warning", "running");
-
-		const endTime = (job.status === "complete" || job.status === "failed") ? (job.updatedAt ?? Date.now()) : Date.now();
-		const elapsed = job.startedAt ? formatDuration(endTime - job.startedAt) : "";
-		const activitySuffix = activityParts.length ? ` | ${activityParts.join(" · ")}` : "";
-
-		lines.push(truncLine(`- ${id} ${status} | ${agentLabel}${elapsed ? ` | ${elapsed}` : ""}${activitySuffix}`, w));
 	}
+	lines.push(truncLine(line2, w));
+
+	const footerStatusParts: string[] = [];
+	if (counts.running > 0) footerStatusParts.push(`${counts.running}r`);
+	if (counts.queued > 0) footerStatusParts.push(`${counts.queued}q`);
+	if (counts.done > 0) footerStatusParts.push(`${counts.done}d`);
+	if (counts.failed > 0) footerStatusParts.push(`${counts.failed}f`);
+	ctx.ui.setStatus("subagents", footerStatusParts.length > 0 ? `sub:${footerStatusParts.join("/")}` : undefined);
 
 	ctx.ui.setWidget(WIDGET_KEY, lines);
 }

@@ -103,6 +103,15 @@ function isPidAlive(pid: number | undefined): boolean {
 	}
 }
 
+function getOutputMtimeMs(filePath: string | undefined): number {
+	if (!filePath) return 0;
+	try {
+		return fs.statSync(filePath).mtimeMs || 0;
+	} catch {
+		return 0;
+	}
+}
+
 /**
  * Cleanup async run directories using state-aware retention:
  * - complete: delete after 2h
@@ -295,7 +304,12 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					job.currentStep = status.currentStep ?? job.currentStep;
 					job.stepsTotal = status.steps?.length ?? job.stepsTotal;
 					job.startedAt = status.startedAt ?? job.startedAt;
-					job.updatedAt = status.lastUpdate ?? Date.now();
+					const observedUpdate = Math.max(
+						status.lastUpdate ?? 0,
+						status.endedAt ?? 0,
+						getOutputMtimeMs(status.outputFile),
+					);
+					job.updatedAt = observedUpdate || Date.now();
 					if (status.steps?.length) {
 						job.agents = status.steps.map((step) => step.agent);
 					}
@@ -345,6 +359,94 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
 		}, POLL_INTERVAL_MS);
 		poller.unref?.();
+	};
+
+	const rehydrateAsyncJobsFromDisk = () => {
+		let dirs: string[] = [];
+		try {
+			dirs = fs.readdirSync(ASYNC_DIR).filter((d) => {
+				try {
+					return fs.statSync(path.join(ASYNC_DIR, d)).isDirectory();
+				} catch {
+					return false;
+				}
+			});
+		} catch {
+			return;
+		}
+
+		for (const dir of dirs) {
+			const dirPath = path.join(ASYNC_DIR, dir);
+			const status = readStatus(dirPath);
+			if (!status) continue;
+
+			let nextState = status.state ?? "failed";
+			const statusPid = (status as unknown as { pid?: number }).pid;
+			if ((nextState === "running" || nextState === "queued") && statusPid && !isPidAlive(statusPid)) {
+				nextState = "failed";
+				try {
+					const statusPath = path.join(dirPath, "status.json");
+					const updated = {
+						...(status as unknown as Record<string, unknown>),
+						state: "failed",
+						endedAt: (status as unknown as { endedAt?: number }).endedAt ?? Date.now(),
+						lastUpdate: Date.now(),
+						error:
+							(status as unknown as { error?: string }).error ??
+							`Process ${statusPid} died (detected by rehydrate)`,
+					};
+					fs.writeFileSync(statusPath, JSON.stringify(updated, null, 2));
+				} catch {
+					/* ignore */
+				}
+			}
+
+			const steps = (status.steps ?? []) as Record<string, unknown>[];
+			const stepModels = steps.map((s) => ((s.resolvedModel ?? s.model ?? "") as string));
+			let liveCost = 0;
+			let toolCount = 0;
+			for (const s of steps) {
+				if (typeof s.liveCost === "number") liveCost += s.liveCost;
+				if (typeof s.toolCount === "number") toolCount += s.toolCount;
+			}
+
+			const activeStep = steps[status.currentStep ?? 0];
+			const observedUpdate = Math.max(
+				status.lastUpdate ?? 0,
+				status.endedAt ?? 0,
+				getOutputMtimeMs(status.outputFile),
+			);
+
+			const asyncId = dir.slice(0, 36);
+			asyncJobs.set(asyncId, {
+				asyncId,
+				asyncDir: dirPath,
+				status: nextState,
+				mode: status.mode ?? "single",
+				agents: status.steps?.map((s: { agent: string }) => s.agent),
+				currentStep: status.currentStep,
+				stepsTotal: status.steps?.length,
+				startedAt: status.startedAt,
+				updatedAt: observedUpdate || Date.now(),
+				sessionDir: status.sessionDir,
+				outputFile: status.outputFile,
+				totalTokens: status.totalTokens,
+				currentTool: activeStep?.currentTool as string | undefined,
+				currentToolArgs: activeStep?.currentToolArgs as string | undefined,
+				activeChildren:
+					typeof activeStep?.activeChildren === "number"
+						? (activeStep.activeChildren as number)
+						: undefined,
+				stepModels,
+				liveCost: liveCost > 0 ? liveCost : undefined,
+				toolCount: toolCount > 0 ? toolCount : undefined,
+				sessionFile: status.sessionFile,
+			});
+
+			if ((nextState === "complete" || nextState === "failed") && !cleanupTimers.has(asyncId)) {
+				scheduleFinishedJobCleanup(asyncId, nextState, dirPath);
+			}
+		}
 	};
 
 	const completionSeen = new Map<string, number>();
@@ -496,15 +598,15 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			const hasSingle = Boolean(params.agent && params.task);
 
 			const requestedAsync = params.async ?? asyncByDefault;
-			const parallelDowngraded = hasTasks && requestedAsync;
 			// clarify implies sync mode (TUI is blocking)
 			// - Chains default to TUI (clarify: true), so async requires explicit clarify: false
-			// - Single defaults to no TUI, so async is allowed unless clarify: true is passed
-			const effectiveAsync = requestedAsync && !hasTasks && (
+			// - Single/parallel default to no TUI, so async is allowed unless clarify: true is passed
+			const effectiveAsync = requestedAsync && (
 				hasChain 
 					? params.clarify === false    // chains: only async if TUI explicitly disabled
-					: params.clarify !== true     // single: async unless TUI explicitly enabled
+					: params.clarify !== true     // single/parallel: async unless TUI explicitly enabled
 			);
+			const parallelDowngraded = hasTasks && requestedAsync && !effectiveAsync;
 			const runLogNoisyEvents = params.debugNoisyEvents ?? asyncLogNoisyEvents;
 
 			const artifactConfig: ArtifactConfig = {
@@ -614,6 +716,33 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 						shareEnabled,
 						sessionRoot,
 						chainSkills,
+						logNoisyEvents: runLogNoisyEvents,
+					});
+				}
+
+				if (hasTasks && params.tasks) {
+					const parallelTasks = params.tasks.map((t) => {
+						const modelOverride = (t as { model?: string }).model;
+						const skillOverride = normalizeSkillInput((t as { skill?: string | string[] | boolean }).skill);
+						return {
+							agent: t.agent,
+							task: t.task,
+							cwd: t.cwd,
+							...(modelOverride ? { model: modelOverride } : {}),
+							...(skillOverride !== undefined ? { skill: skillOverride } : {}),
+						};
+					});
+					return executeAsyncChain(id, {
+						chain: [{ parallel: parallelTasks }],
+						agents,
+						ctx: asyncCtx,
+						cwd: params.cwd,
+						maxOutput: params.maxOutput,
+						artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
+						artifactConfig,
+						shareEnabled,
+						sessionRoot,
+						chainSkills: [],
 						logNoisyEvents: runLogNoisyEvents,
 					});
 				}
@@ -870,7 +999,9 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				}
 
 				const ok = results.filter((r) => r.exitCode === 0).length;
-				const downgradeNote = parallelDowngraded ? " (async not supported for parallel)" : "";
+				const downgradeNote = parallelDowngraded
+					? " (async requested but clarify=true forced sync; use clarify background toggle)"
+					: "";
 
 				// Aggregate outputs from all parallel tasks
 				const aggregatedOutput = results
@@ -1071,7 +1202,19 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				);
 			}
 			const isParallel = (args.tasks?.length ?? 0) > 0;
-			const asyncLabel = args.async === true && !isParallel ? theme.fg("warning", " [async]") : "";
+			const chainParallelCount = Array.isArray(args.chain) && args.chain.length === 1
+				? (Array.isArray((args.chain[0] as { parallel?: unknown[] }).parallel)
+					? ((args.chain[0] as { parallel?: unknown[] }).parallel?.length ?? 0)
+					: 0)
+				: 0;
+			const asyncLabel = args.async === true ? theme.fg("warning", " [async]") : "";
+			if (chainParallelCount > 0) {
+				return new Text(
+					`${theme.fg("toolTitle", theme.bold("subagent "))}parallel (${chainParallelCount})${asyncLabel}`,
+					0,
+					0,
+				);
+			}
 			if (args.chain?.length)
 				return new Text(
 					`${theme.fg("toolTitle", theme.bold("subagent "))}chain (${args.chain.length})${asyncLabel}`,
@@ -2201,9 +2344,11 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		cleanupTimers.clear();
 		asyncJobs.clear();
 		resultFileCoalescer.clear();
+		rehydrateAsyncJobsFromDisk();
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
-			renderWidget(ctx, []);
+			renderWidget(ctx, Array.from(asyncJobs.values()));
+			if (asyncJobs.size > 0) ensurePoller();
 		}
 	});
 	pi.on("session_switch", (_event, ctx) => {
@@ -2215,9 +2360,11 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		cleanupTimers.clear();
 		asyncJobs.clear();
 		resultFileCoalescer.clear();
+		rehydrateAsyncJobsFromDisk();
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
-			renderWidget(ctx, []);
+			renderWidget(ctx, Array.from(asyncJobs.values()));
+			if (asyncJobs.size > 0) ensurePoller();
 		}
 	});
 	pi.on("session_branch", (_event, ctx) => {
@@ -2229,9 +2376,11 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		cleanupTimers.clear();
 		asyncJobs.clear();
 		resultFileCoalescer.clear();
+		rehydrateAsyncJobsFromDisk();
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
-			renderWidget(ctx, []);
+			renderWidget(ctx, Array.from(asyncJobs.values()));
+			if (asyncJobs.size > 0) ensurePoller();
 		}
 	});
 	pi.on("session_shutdown", () => {
