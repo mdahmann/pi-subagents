@@ -92,6 +92,7 @@ function ensureAccessibleDir(dirPath: string): void {
 const ASYNC_SUCCESS_RETENTION_MS = 2 * 60 * 60 * 1000; // 2h
 const ASYNC_FAILED_RETENTION_MS = 6 * 60 * 60 * 1000;  // 6h
 const ASYNC_UNKNOWN_RETENTION_MS = 24 * 60 * 60 * 1000; // 24h fallback
+const WIDGET_FINISHED_VISIBILITY_MS = 10_000;
 
 function isPidAlive(pid: number | undefined): boolean {
 	if (!pid || !Number.isFinite(pid)) return false;
@@ -223,25 +224,22 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	cleanupAllArtifactDirs(DEFAULT_ARTIFACT_CONFIG.cleanupDays);
 	let baseCwd = process.cwd();
 	let currentSessionId: string | null = null;
-	const asyncJobs = new Map<string, AsyncJobState>();
-	const cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>(); // Widget cleanup timers
+	const asyncJobs = new Map<string, AsyncJobState & { finishedAt?: number }>();
 	const asyncDirCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>(); // Disk cleanup timers
 	let lastUiContext: ExtensionContext | null = null;
 	let poller: NodeJS.Timeout | null = null;
 
-	const scheduleFinishedJobCleanup = (asyncId: string, status: "complete" | "failed", asyncDir?: string) => {
-		const existingUiTimer = cleanupTimers.get(asyncId);
-		if (existingUiTimer) clearTimeout(existingUiTimer);
-		const uiTimer = setTimeout(() => {
-			cleanupTimers.delete(asyncId);
-			asyncJobs.delete(asyncId);
-			if (lastUiContext) renderWidget(lastUiContext, Array.from(asyncJobs.values()));
-		}, 10000);
-		cleanupTimers.set(asyncId, uiTimer);
+	const renderAsyncWidget = (ctx: ExtensionContext) => {
+		const cutoff = Date.now() - WIDGET_FINISHED_VISIBILITY_MS;
+		const visibleJobs = Array.from(asyncJobs.values())
+			.filter((job) => job.finishedAt === undefined || job.finishedAt > cutoff);
+		renderWidget(ctx, visibleJobs);
+	};
 
-		if (!asyncDir) return;
-		const existingDiskTimer = asyncDirCleanupTimers.get(asyncId);
-		if (existingDiskTimer) clearTimeout(existingDiskTimer);
+	const scheduleFinishedJobCleanup = (
+		asyncId: string, status: "complete" | "failed", finishedAt: number, asyncDir?: string,
+	) => {
+		if (!asyncDir || asyncDirCleanupTimers.has(asyncId)) return;
 		const ttl = status === "complete" ? ASYNC_SUCCESS_RETENTION_MS : ASYNC_FAILED_RETENTION_MS;
 		const diskTimer = setTimeout(() => {
 			asyncDirCleanupTimers.delete(asyncId);
@@ -255,7 +253,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 					fs.rmSync(asyncDir, { recursive: true, force: true });
 				}
 			} catch {}
-		}, ttl);
+		}, Math.max(0, finishedAt + ttl - Date.now()));
 		asyncDirCleanupTimers.set(asyncId, diskTimer);
 	};
 
@@ -263,107 +261,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		if (poller) return;
 		poller = setInterval(() => {
 			if (!lastUiContext || !lastUiContext.hasUI) return;
-			// Keep widget source aligned with /subagents overlay by continuously
-			// pulling jobs from disk status files.
 			rehydrateAsyncJobsFromDisk();
-			if (asyncJobs.size === 0) {
-				renderWidget(lastUiContext, []);
-				return;
-			}
-
-			for (const job of asyncJobs.values()) {
-				// Finished jobs should be auto-removed from widget shortly, even if
-				// subagent:complete event was missed (e.g. hard kill/crash).
-				if (job.status === "complete" || job.status === "failed") {
-					if (!cleanupTimers.has(job.asyncId)) {
-						scheduleFinishedJobCleanup(job.asyncId, job.status, job.asyncDir);
-					}
-					continue;
-				}
-
-				const status = readStatus(job.asyncDir);
-				if (status) {
-					let nextState = status.state;
-					const statusPid = (status as unknown as { pid?: number }).pid;
-					if ((nextState === "running" || nextState === "queued") && statusPid && !isPidAlive(statusPid)) {
-						nextState = "failed";
-						try {
-							const statusPath = path.join(job.asyncDir, "status.json");
-							const updated = {
-								...(status as unknown as Record<string, unknown>),
-								state: "failed",
-								endedAt: (status as unknown as { endedAt?: number }).endedAt ?? Date.now(),
-								lastUpdate: Date.now(),
-								error: (status as unknown as { error?: string }).error ?? `Process ${statusPid} died (detected by widget poller)`,
-							};
-							fs.writeFileSync(statusPath, JSON.stringify(updated, null, 2));
-						} catch {}
-					}
-
-					job.status = nextState;
-					job.mode = status.mode;
-					job.currentStep = status.currentStep ?? job.currentStep;
-					job.stepsTotal = status.steps?.length ?? job.stepsTotal;
-					job.startedAt = status.startedAt ?? job.startedAt;
-					const observedUpdate = Math.max(
-						status.lastUpdate ?? 0,
-						status.endedAt ?? 0,
-						getOutputMtimeMs(status.outputFile),
-					);
-					job.updatedAt = observedUpdate || Date.now();
-					if (status.steps?.length) {
-						job.agents = status.steps.map((step) => step.agent);
-					}
-					job.sessionDir = status.sessionDir ?? job.sessionDir;
-					job.outputFile = status.outputFile ?? job.outputFile;
-					job.totalTokens = status.totalTokens ?? job.totalTokens;
-					// Pull live metrics from steps
-					if (status.steps?.length) {
-						const activeStep = status.steps[status.currentStep ?? 0] as Record<string, unknown>;
-						if (!job.totalTokens) {
-							const lt = activeStep?.liveTokens as { total?: number; input?: number; output?: number } | undefined;
-							if (lt?.total) {
-								job.totalTokens = { input: lt.input ?? 0, output: lt.output ?? 0, total: lt.total };
-							}
-						}
-						job.currentTool = activeStep?.currentTool as string | undefined;
-						job.currentToolArgs = activeStep?.currentToolArgs as string | undefined;
-						job.activeChildren = typeof activeStep?.activeChildren === "number"
-							? (activeStep.activeChildren as number)
-							: undefined;
-
-						// Model + cost + tool count from all steps
-						const models: string[] = [];
-						let totalCost = 0;
-						let totalTools = 0;
-						for (const s of status.steps as Record<string, unknown>[]) {
-							models.push((s.resolvedModel ?? s.model ?? "") as string);
-							if (typeof s.liveCost === "number") totalCost += s.liveCost;
-							if (typeof s.toolCount === "number") totalTools += s.toolCount;
-						}
-						job.stepModels = models;
-						if (totalCost > 0) job.liveCost = totalCost;
-						if (totalTools > 0) job.toolCount = totalTools;
-					}
-					job.sessionFile = status.sessionFile ?? job.sessionFile;
-					// job.shareUrl = status.shareUrl ?? job.shareUrl;
-				} else {
-					job.status = job.status === "queued" ? "running" : job.status;
-					job.updatedAt = Date.now();
-				}
-
-				if ((job.status === "complete" || job.status === "failed") && !cleanupTimers.has(job.asyncId)) {
-					scheduleFinishedJobCleanup(job.asyncId, job.status, job.asyncDir);
-				}
-			}
-
-			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
+			renderAsyncWidget(lastUiContext);
 		}, POLL_INTERVAL_MS);
 		poller.unref?.();
 	};
 
 	const rehydrateAsyncJobsFromDisk = () => {
-		let dirs: string[] = [];
+		let dirs: string[];
 		try {
 			dirs = fs.readdirSync(ASYNC_DIR).filter((d) => {
 				try {
@@ -376,31 +281,37 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
+		const existingDirs = new Set(dirs.map((dir) => path.join(ASYNC_DIR, dir)));
+		for (const [id, job] of asyncJobs) {
+			if (!existingDirs.has(job.asyncDir)) asyncJobs.delete(id);
+		}
 		for (const dir of dirs) {
 			const dirPath = path.join(ASYNC_DIR, dir);
-			const status = readStatus(dirPath);
+			let status = readStatus(dirPath);
 			if (!status) continue;
 
-			let nextState = status.state ?? "failed";
+			const now = Date.now();
+			const asyncId = dir.slice(0, 36);
+			const previousJob = asyncJobs.get(asyncId);
 			const statusPid = (status as unknown as { pid?: number }).pid;
-			if ((nextState === "running" || nextState === "queued") && statusPid && !isPidAlive(statusPid)) {
-				nextState = "failed";
+			if ((status.state === "running" || status.state === "queued") && statusPid && !isPidAlive(statusPid)) {
+				status = {
+					...status,
+					state: "failed",
+					endedAt: status.endedAt ?? previousJob?.finishedAt ?? now,
+					lastUpdate: now,
+					error: status.error ?? `Process ${statusPid} died (detected by rehydrate)`,
+				};
 				try {
-					const statusPath = path.join(dirPath, "status.json");
-					const updated = {
-						...(status as unknown as Record<string, unknown>),
-						state: "failed",
-						endedAt: (status as unknown as { endedAt?: number }).endedAt ?? Date.now(),
-						lastUpdate: Date.now(),
-						error:
-							(status as unknown as { error?: string }).error ??
-							`Process ${statusPid} died (detected by rehydrate)`,
-					};
-					fs.writeFileSync(statusPath, JSON.stringify(updated, null, 2));
+					fs.writeFileSync(path.join(dirPath, "status.json"), JSON.stringify(status, null, 2));
 				} catch {
 					/* ignore */
 				}
 			}
+			const state = status.state ?? "failed";
+			const finishedAt = state === "complete" || state === "failed"
+				? status.endedAt ?? status.lastUpdate ?? previousJob?.finishedAt ?? status.startedAt ?? now
+				: undefined;
 
 			const steps = (status.steps ?? []) as Record<string, unknown>[];
 			const stepModels = steps.map((s) => ((s.resolvedModel ?? s.model ?? "") as string));
@@ -412,26 +323,29 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			}
 
 			const activeStep = steps[status.currentStep ?? 0];
+			const lt = activeStep?.liveTokens as { total?: number; input?: number; output?: number } | undefined;
 			const observedUpdate = Math.max(
 				status.lastUpdate ?? 0,
 				status.endedAt ?? 0,
 				getOutputMtimeMs(status.outputFile),
 			);
 
-			const asyncId = dir.slice(0, 36);
 			asyncJobs.set(asyncId, {
 				asyncId,
 				asyncDir: dirPath,
-				status: nextState,
+				status: state,
 				mode: status.mode ?? "single",
 				agents: status.steps?.map((s: { agent: string }) => s.agent),
 				currentStep: status.currentStep,
 				stepsTotal: status.steps?.length,
 				startedAt: status.startedAt,
-				updatedAt: observedUpdate || Date.now(),
+				updatedAt: observedUpdate || previousJob?.updatedAt || now,
+				finishedAt,
 				sessionDir: status.sessionDir,
 				outputFile: status.outputFile,
-				totalTokens: status.totalTokens,
+				totalTokens: status.totalTokens ?? (lt?.total
+					? { input: lt.input ?? 0, output: lt.output ?? 0, total: lt.total }
+					: undefined),
 				currentTool: activeStep?.currentTool as string | undefined,
 				currentToolArgs: activeStep?.currentToolArgs as string | undefined,
 				activeChildren:
@@ -444,8 +358,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				sessionFile: status.sessionFile,
 			});
 
-			if ((nextState === "complete" || nextState === "failed") && !cleanupTimers.has(asyncId)) {
-				scheduleFinishedJobCleanup(asyncId, nextState, dirPath);
+			if ((state === "complete" || state === "failed") && finishedAt !== undefined) {
+				scheduleFinishedJobCleanup(asyncId, state, finishedAt, dirPath);
 			}
 		}
 	};
@@ -1771,11 +1685,6 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							removed++;
 							asyncJobs.delete(dir);
 
-							const uiTimer = cleanupTimers.get(dir);
-							if (uiTimer) {
-								clearTimeout(uiTimer);
-								cleanupTimers.delete(dir);
-							}
 							const diskTimer = asyncDirCleanupTimers.get(dir);
 							if (diskTimer) {
 								clearTimeout(diskTimer);
@@ -1797,7 +1706,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 				}
 
 				if (lastUiContext) {
-					renderWidget(lastUiContext, Array.from(asyncJobs.values()));
+					renderAsyncWidget(lastUiContext);
 				}
 
 				ctx.ui.notify(
@@ -2294,7 +2203,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			updatedAt: now,
 		});
 		if (lastUiContext) {
-			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
+			renderAsyncWidget(lastUiContext);
 			ensurePoller();
 		}
 	});
@@ -2303,18 +2212,20 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		const result = data as { id?: string; success?: boolean; asyncDir?: string };
 		const asyncId = result.id;
 		if (!asyncId) return;
+		const finalStatus = result.success ? "complete" : "failed";
+		const now = Date.now();
 		const job = asyncJobs.get(asyncId);
 		if (job) {
-			job.status = result.success ? "complete" : "failed";
-			job.updatedAt = Date.now();
+			job.status = finalStatus;
+			job.updatedAt = now;
+			job.finishedAt ??= now;
 			if (result.asyncDir) job.asyncDir = result.asyncDir;
 		}
 		if (lastUiContext) {
-			renderWidget(lastUiContext, Array.from(asyncJobs.values()));
+			renderAsyncWidget(lastUiContext);
 		}
 
-		const finalStatus: "complete" | "failed" = result.success ? "complete" : "failed";
-		scheduleFinishedJobCleanup(asyncId, finalStatus, result.asyncDir ?? job?.asyncDir);
+		scheduleFinishedJobCleanup(asyncId, finalStatus, job?.finishedAt ?? now, result.asyncDir ?? job?.asyncDir);
 	});
 
 	pi.on("tool_result", (event, ctx) => {
@@ -2322,7 +2233,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		if (!ctx.hasUI) return;
 		lastUiContext = ctx;
 		if (asyncJobs.size > 0) {
-			renderWidget(ctx, Array.from(asyncJobs.values()));
+			renderAsyncWidget(ctx);
 			ensurePoller();
 		}
 	});
@@ -2341,14 +2252,12 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		cleanupSessionArtifacts(ctx);
 		cleanupOldAsyncDirs(ASYNC_DIR);
-		for (const timer of cleanupTimers.values()) clearTimeout(timer);
-		cleanupTimers.clear();
 		asyncJobs.clear();
 		resultFileCoalescer.clear();
 		rehydrateAsyncJobsFromDisk();
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
-			renderWidget(ctx, Array.from(asyncJobs.values()));
+			renderAsyncWidget(ctx);
 			ensurePoller();
 		}
 	});
@@ -2357,14 +2266,12 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		cleanupSessionArtifacts(ctx);
 		cleanupOldAsyncDirs(ASYNC_DIR);
-		for (const timer of cleanupTimers.values()) clearTimeout(timer);
-		cleanupTimers.clear();
 		asyncJobs.clear();
 		resultFileCoalescer.clear();
 		rehydrateAsyncJobsFromDisk();
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
-			renderWidget(ctx, Array.from(asyncJobs.values()));
+			renderAsyncWidget(ctx);
 			ensurePoller();
 		}
 	});
@@ -2373,14 +2280,12 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		currentSessionId = ctx.sessionManager.getSessionFile() ?? `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		cleanupSessionArtifacts(ctx);
 		cleanupOldAsyncDirs(ASYNC_DIR);
-		for (const timer of cleanupTimers.values()) clearTimeout(timer);
-		cleanupTimers.clear();
 		asyncJobs.clear();
 		resultFileCoalescer.clear();
 		rehydrateAsyncJobsFromDisk();
 		if (ctx.hasUI) {
 			lastUiContext = ctx;
-			renderWidget(ctx, Array.from(asyncJobs.values()));
+			renderAsyncWidget(ctx);
 			ensurePoller();
 		}
 	});
@@ -2390,11 +2295,6 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 		watcherRestartTimer = null;
 		if (poller) clearInterval(poller);
 		poller = null;
-		// Clear all pending cleanup timers
-		for (const timer of cleanupTimers.values()) {
-			clearTimeout(timer);
-		}
-		cleanupTimers.clear();
 		for (const timer of asyncDirCleanupTimers.values()) {
 			clearTimeout(timer);
 		}

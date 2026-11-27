@@ -8,7 +8,6 @@ import { Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth, type 
 import {
 	type AsyncJobState,
 	type Details,
-	MAX_WIDGET_JOBS,
 	WIDGET_KEY,
 } from "./types.js";
 import { formatTokens, formatUsage, formatDuration, formatToolCall, shortenPath } from "./formatters.js";
@@ -85,21 +84,8 @@ function truncLine(text: string, maxWidth: number): string {
 	return result + activeStyles.join("") + "…";
 }
 
-// Track last rendered widget state to avoid no-op re-renders
-let lastWidgetHash = "";
-let lastWidgetRenderAt = 0;
+let lastWidgetLines: string[] = [];
 let focusedRunningAsyncId: string | undefined;
-const WIDGET_MIN_RENDER_MS = 900;
-
-/**
- * Compute a simple hash of job states for change detection
- */
-function computeWidgetHash(jobs: AsyncJobState[]): string {
-	const sample = jobs.slice(0, MAX_WIDGET_JOBS).map(job =>
-		`${job.asyncId}:${job.status}:${job.currentStep}:${job.updatedAt}:${job.totalTokens?.total ?? 0}`
-	).join("|");
-	return `${jobs.length}|${sample}`;
-}
 
 function formatAgoShort(msAgo: number): string {
 	if (!Number.isFinite(msAgo) || msAgo < 0) return "?";
@@ -136,9 +122,8 @@ function hasEmptyTextOutputWithoutOutputTarget(task: string, output: string): bo
 export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void {
 	if (!ctx.hasUI) return;
 	if (jobs.length === 0) {
-		if (lastWidgetHash !== "") {
-			lastWidgetHash = "";
-			lastWidgetRenderAt = 0;
+		if (lastWidgetLines.length > 0) {
+			lastWidgetLines = [];
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 		}
 		focusedRunningAsyncId = undefined;
@@ -146,20 +131,7 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 		return;
 	}
 
-	// Check if anything changed since last render
 	const now = Date.now();
-	const displayedJobs = jobs.slice(0, MAX_WIDGET_JOBS);
-	const hasRunningJobs = displayedJobs.some(job => job.status === "running" || job.status === "queued");
-	const newHash = computeWidgetHash(jobs);
-	if (!hasRunningJobs && newHash === lastWidgetHash) {
-		return;
-	}
-	if (hasRunningJobs && newHash === lastWidgetHash && (now - lastWidgetRenderAt) < WIDGET_MIN_RENDER_MS) {
-		return;
-	}
-	lastWidgetHash = newHash;
-	lastWidgetRenderAt = now;
-
 	const theme = ctx.ui.theme;
 	const w = getTermWidth();
 	const lines: string[] = [];
@@ -226,6 +198,8 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[]): void
 	}
 	lines.push(truncLine(line2, w));
 
+	if (lines.every((line, index) => line === lastWidgetLines[index])) return;
+	lastWidgetLines = lines;
 	ctx.ui.setWidget(WIDGET_KEY, lines);
 }
 
