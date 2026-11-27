@@ -41,7 +41,7 @@ import {
 	WIDGET_KEY,
 	checkSubagentDepth,
 } from "./types.js";
-import { readStatus, findByPrefix, getFinalOutput, getOutputTail, mapConcurrent, getLastActivity } from "./utils.js";
+import { readStatus, findByPrefix, getFinalOutput, getOutputTail, mapConcurrent, getLastActivity, readFileTail } from "./utils.js";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.js";
 import { createFileCoalescer } from "./file-coalescer.js";
 import { runSync } from "./execution.js";
@@ -92,6 +92,7 @@ function ensureAccessibleDir(dirPath: string): void {
 const ASYNC_SUCCESS_RETENTION_MS = 2 * 60 * 60 * 1000; // 2h
 const ASYNC_FAILED_RETENTION_MS = 6 * 60 * 60 * 1000;  // 6h
 const ASYNC_UNKNOWN_RETENTION_MS = 24 * 60 * 60 * 1000; // 24h fallback
+const INSPECTOR_LOG_TAIL_BYTES = 256 * 1024;
 
 function isPidAlive(pid: number | undefined): boolean {
 	if (!pid || !Number.isFinite(pid)) return false;
@@ -1907,7 +1908,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			const parseOutputLog = (logPath: string, maxEntries = 200): string[] => {
 				const entries: string[] = [];
 				try {
-					const content = fs.readFileSync(logPath, "utf-8");
+					const content = readFileTail(logPath, INSPECTOR_LOG_TAIL_BYTES);
 					const lines = content.split("\n");
 					for (const line of lines) {
 						if (!line.startsWith("{")) continue;
@@ -1950,12 +1951,11 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 							const msg = (evt.message ?? evt.error ?? "unknown error") as string;
 							entries.push(`❌ ${msg.slice(0, 200)}`);
 						}
-						if (entries.length >= maxEntries) break;
 					}
 				} catch (e) {
 					entries.push(`(could not read log: ${(e as Error).message})`);
 				}
-				return entries;
+				return entries.slice(-maxEntries);
 			};
 
 			// ── Detail overlay for a single job ──
@@ -2010,7 +2010,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 					allLines.push("");
 				}
 				if (timeline.length) {
-					allLines.push(`ACTIVITY LOG (${timeline.length} events)`);
+					allLines.push(`RECENT ACTIVITY (${timeline.length} events)`);
 					allLines.push(...timeline);
 					allLines.push("");
 				}

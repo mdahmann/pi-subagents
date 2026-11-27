@@ -20,6 +20,8 @@ const available = !!(asyncMod && utils);
 
 const isAsyncAvailable = asyncMod?.isAsyncAvailable;
 const readStatus = utils?.readStatus;
+const getOutputTail = utils?.getOutputTail;
+const readFileTail = utils?.readFileTail;
 
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	it("reports jiti availability as boolean", () => {
@@ -71,6 +73,32 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			assert.ok(s1);
 			assert.ok(s2);
 			assert.equal(s1.runId, s2.runId);
+		} finally {
+			removeTempDir(dir);
+		}
+	});
+
+	it("returns a larger output tail after a smaller cached request", () => {
+		const dir = createTempDir();
+		try {
+			const log = path.join(dir, "output.log");
+			fs.writeFileSync(log, "one\ntwo\nthree\n");
+			assert.deepEqual(getOutputTail(log, 1), ["three"]);
+			assert.deepEqual(getOutputTail(log, 3), ["one", "two", "three"]);
+		} finally {
+			removeTempDir(dir);
+		}
+	});
+
+	it("reads a UTF-8 log tail without returning a cut-off leading line", () => {
+		const dir = createTempDir();
+		try {
+			const log = path.join(dir, "output.log");
+			const lastLine = "last 🐈\n";
+			const lastTwoLines = `middle text\n${lastLine}`;
+			fs.writeFileSync(log, `first\n${lastTwoLines}`);
+			assert.equal(readFileTail(log, Buffer.byteLength(lastTwoLines)), lastTwoLines);
+			assert.equal(readFileTail(log, Buffer.byteLength(`text\n${lastLine}`)), lastLine);
 		} finally {
 			removeTempDir(dir);
 		}
