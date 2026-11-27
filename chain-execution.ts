@@ -332,8 +332,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					const taskAgentConfig = agents.find((a) => a.name === task.agent);
 					const effectiveModel =
 						(task.model ? resolveModelFullId(task.model, availableModels) : null)
-						?? (parentModel ? resolveModelFullId(parentModel, availableModels) : null)
-						?? resolveModelFullId(taskAgentConfig?.model, availableModels);
+						?? resolveModelFullId(taskAgentConfig?.model, availableModels)
+						?? resolveModelFullId(parentModel, availableModels);
 
 					const r = await runSync(ctx.cwd, agents, task.agent, taskStr, {
 						cwd: task.cwd ?? cwd,
@@ -484,12 +484,12 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			// Assemble final task: prefix (READ/WRITE instructions) + task + suffix (progress, previous summary)
 			stepTask = prefix + stepTask + suffix;
 
-			// Resolve model: TUI override > step override > parent model > agent frontmatter
+			// Resolve model: TUI override > step override > agent frontmatter > parent model
 			const effectiveModel =
 				tuiOverride?.model
 				?? (seqStep.model ? resolveModelFullId(seqStep.model, availableModels) : null)
-				?? (parentModel ? resolveModelFullId(parentModel, availableModels) : null)
-				?? resolveModelFullId(agentConfig.model, availableModels);
+				?? resolveModelFullId(agentConfig.model, availableModels)
+				?? resolveModelFullId(parentModel, availableModels);
 
 			// Run step
 			const r = await runSync(ctx.cwd, agents, seqStep.agent, stepTask, {

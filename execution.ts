@@ -79,7 +79,7 @@ export async function runSync(
 		} catch {}
 		args.push("--session-dir", options.sessionDir);
 	}
-	const effectiveModel = modelOverride ?? parentModel ?? agent.model;
+	const effectiveModel = modelOverride ?? agent.model ?? parentModel;
 	const modelArg = applyThinkingSuffix(effectiveModel, agent.thinking);
 	// Use --models (not --model) because pi CLI silently ignores --model
 	// without a companion --provider flag. --models resolves the provider

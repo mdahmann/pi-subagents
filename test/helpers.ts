@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import type { TestContext } from "node:test";
 import { createMockPi as _createMockPi } from "@marcfargas/pi-test-harness";
 import type { MockPi } from "@marcfargas/pi-test-harness";
 
@@ -116,6 +117,29 @@ export function createMockPi(): MockPi {
 			return inner.callCount();
 		},
 	};
+}
+
+export function captureMockPiModels(t: TestContext, dir: string): () => (string | undefined)[] {
+	const argsPath = path.join(dir, "pi-args.jsonl");
+	const preload = new URL("./capture-pi-args.mjs", import.meta.url).href;
+	const env = {
+		NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${preload}`].filter(Boolean).join(" "),
+		MOCK_PI_ARGS_PATH: argsPath,
+		MOCK_PI_SCRIPT: findHarnessMockPiScript(),
+	};
+	for (const [key, value] of Object.entries(env)) {
+		const previous = process.env[key];
+		process.env[key] = value;
+		t.after(() => {
+			if (previous === undefined) delete process.env[key];
+			else process.env[key] = previous;
+		});
+	}
+	return () => fs.readFileSync(argsPath, "utf-8").trim().split("\n").map((line) => {
+		const args: string[] = JSON.parse(line);
+		const index = args.indexOf("--models");
+		return index < 0 ? undefined : args[index + 1];
+	});
 }
 
 // ---------------------------------------------------------------------------
