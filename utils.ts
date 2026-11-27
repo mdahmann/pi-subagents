@@ -42,6 +42,7 @@ export function readStatus(asyncDir: string): AsyncStatus | null {
 
 // Cache for output tail reads - avoid re-reading unchanged files
 const outputTailCache = new Map<string, { mtime: number; size: number; lines: string[] }>();
+const MAX_OUTPUT_TAIL_LINES = 200;
 
 /**
  * Get the last N lines from an output file (with mtime/size-based caching)
@@ -107,7 +108,7 @@ export function getOutputTail(outputFile: string | undefined, maxLines: number =
 		const stat = fs.statSync(outputFile);
 		if (stat.size === 0) return [];
 
-		const safeMaxLines = Math.max(1, Math.min(200, Math.floor(maxLines || 3)));
+		const safeMaxLines = Math.max(1, Math.min(MAX_OUTPUT_TAIL_LINES, Math.floor(maxLines || 3)));
 		const safeMaxChars = Math.max(40, Math.min(4000, Math.floor(maxLineChars || 120)));
 
 		// Check cache using both mtime and size (size changes more frequently during writes)
@@ -125,7 +126,7 @@ export function getOutputTail(outputFile: string | undefined, maxLines: number =
 		const allLines = content.split("\n").filter((l) => l.trim());
 
 		// Extract readable content from JSONL events (or pass through plain text)
-		const readable = extractReadableLines(allLines, safeMaxLines);
+		const readable = extractReadableLines(allLines, MAX_OUTPUT_TAIL_LINES);
 		const lines = readable.slice(-safeMaxLines).map((l) => l.slice(0, safeMaxChars) + (l.length > safeMaxChars ? "…" : ""));
 
 		// Cache the result
@@ -145,6 +146,23 @@ export function getOutputTail(outputFile: string | undefined, maxLines: number =
 				fs.closeSync(fd);
 			} catch {}
 		}
+	}
+}
+
+export function readFileTail(filePath: string, maxBytes: number): string {
+	const fd = fs.openSync(filePath, "r");
+	try {
+		const { size } = fs.fstatSync(fd);
+		const buffer = Buffer.alloc(Math.min(size, maxBytes + 1));
+		const start = size - buffer.length;
+		const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, start);
+		const bytes = buffer.subarray(0, bytesRead);
+		if (size <= maxBytes) return bytes.toString("utf-8");
+
+		const firstNewline = bytes.indexOf(0x0a);
+		return firstNewline === -1 ? "" : bytes.toString("utf-8", firstNewline + 1);
+	} finally {
+		fs.closeSync(fd);
 	}
 }
 
