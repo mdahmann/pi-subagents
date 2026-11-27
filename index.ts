@@ -92,7 +92,6 @@ function ensureAccessibleDir(dirPath: string): void {
 const ASYNC_SUCCESS_RETENTION_MS = 2 * 60 * 60 * 1000; // 2h
 const ASYNC_FAILED_RETENTION_MS = 6 * 60 * 60 * 1000;  // 6h
 const ASYNC_UNKNOWN_RETENTION_MS = 24 * 60 * 60 * 1000; // 24h fallback
-const INSPECTOR_LOG_TAIL_BYTES = 256 * 1024;
 
 function isPidAlive(pid: number | undefined): boolean {
 	if (!pid || !Number.isFinite(pid)) return false;
@@ -1908,7 +1907,7 @@ MANAGEMENT (use action field — omit agent/task/chain/tasks):
 			const parseOutputLog = (logPath: string, maxEntries = 200): string[] => {
 				const entries: string[] = [];
 				try {
-					const content = readFileTail(logPath, INSPECTOR_LOG_TAIL_BYTES);
+					const content = readFileTail(logPath, 256 * 1024);
 					const lines = content.split("\n");
 					for (const line of lines) {
 						if (!line.startsWith("{")) continue;
