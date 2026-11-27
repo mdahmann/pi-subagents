@@ -14,7 +14,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 
 const EXTENSION_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "subagent");
-const REPO_URL = "https://github.com/nicobailon/pi-subagents.git";
+const REPO_URL = "https://github.com/mdahmann/pi-subagents.git";
 
 const args = process.argv.slice(2);
 const isRemove = args.includes("--remove") || args.includes("-r");
