@@ -674,12 +674,12 @@ Press **Ctrl+O** to expand the full streaming view with complete output per step
 
 Subagents can themselves call the `subagent` tool, which risks unbounded recursive spawning (slow, expensive, hard to observe). A depth guard prevents this.
 
-By default nesting is limited to **2 levels**: `main session → subagent → sub-subagent`. Any deeper `subagent` calls are blocked and return an error with guidance to the calling agent.
+By default nesting is limited to **3 levels**: `main session → subagent → sub-subagent → third-level subagent`. Any deeper `subagent` calls are blocked and return an error with guidance to the calling agent.
 
 Override the limit with `PI_SUBAGENT_MAX_DEPTH` **set before starting `pi`**:
 
 ```bash
-export PI_SUBAGENT_MAX_DEPTH=3   # allow one more level (use with caution)
+export PI_SUBAGENT_MAX_DEPTH=2   # allow up to two levels of subagents
 export PI_SUBAGENT_MAX_DEPTH=1   # only allow direct subagents, no nesting
 export PI_SUBAGENT_MAX_DEPTH=0   # disable the subagent tool entirely
 ```
