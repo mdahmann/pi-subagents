@@ -4,21 +4,34 @@
 
 # pi-subagents
 
-Pi extension for delegating tasks to subagents with chains, parallel execution, TUI clarification, and async support.
+Delegate work to single agents, chains, or parallel groups without leaving [Pi](https://github.com/earendil-works/pi).
 
-https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1
+## What this fork adds
+
+This fork builds on [Nico Bailon's pi-subagents](https://github.com/nicobailon/pi-subagents). It adds a compact background-run widget and a `/subagents` browser for running, completed, and failed jobs. The browser shows activity, models, and costs where available, and can recover run history from disk after you restart Pi.
 
 ## Installation
 
 ```bash
-pi install npm:pi-subagents
+pi install git:github.com/mdahmann/pi-subagents
 ```
 
 To remove:
 
 ```bash
-npx pi-subagents --remove
+pi remove git:github.com/mdahmann/pi-subagents
 ```
+
+## Try a background run
+
+In an interactive Pi session, run:
+
+```text
+/run scout Summarize the layout of this repository --bg
+/subagents
+```
+
+The widget tracks the run while you keep working. In `/subagents`, use Tab to switch between Running, Done, and Failed, and Enter to inspect a run.
 
 ## Agents
 
@@ -28,7 +41,7 @@ Agents are markdown files with YAML frontmatter that define specialized subagent
 
 | Scope | Path | Priority |
 |-------|------|----------|
-| Builtin | `~/.pi/agent/extensions/subagent/agents/` | Lowest |
+| Builtin | `agents/` inside the installed package | Lowest |
 | User | `~/.pi/agent/agents/{name}.md` | Medium |
 | Project | `.pi/agents/{name}.md` (searches up directory tree) | Highest |
 
@@ -114,8 +127,11 @@ The MCP adapter's metadata cache must be populated for direct tools to work. On 
 | `/chain agent1 "task1" -> agent2 "task2"` | Run agents in sequence with per-step tasks |
 | `/parallel agent1 "task1" -> agent2 "task2"` | Run agents in parallel with per-step tasks |
 | `/agents` | Open the Agents Manager overlay |
+| `/subagents` | Show active and recent background runs |
+| `/subagents all` | Include all retained background runs |
+| `/subagents clear` | Delete finished and failed run history; keep active and unreadable runs |
 
-All commands validate agent names locally and tab-complete them, then route through the tool framework for full live progress rendering. Results are sent to the conversation for the LLM to discuss.
+The run commands validate and tab-complete agent names, then route through the tool framework for live progress. Results are sent to the conversation for the LLM to discuss. The `/subagents` commands use retained local run history across Pi sessions.
 
 ### Per-Step Tasks
 
@@ -697,8 +713,8 @@ Async runs write a dedicated observability folder:
   subagent-log-<id>.md
 ```
 
-`status.json` is the source of truth for async progress and powers the TUI widget. If you already use
-`/status <id>` you can keep doing that; otherwise use:
+`status.json` is the source of truth for async progress and powers the TUI widget. Use
+`/subagents` in the TUI or query a run with:
 
 ```typescript
 subagent_status({ id: "<id>" })

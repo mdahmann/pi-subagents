@@ -12,7 +12,7 @@ import {
 	WIDGET_KEY,
 } from "./types.js";
 import { formatTokens, formatUsage, formatDuration, formatToolCall, shortenPath } from "./formatters.js";
-import { getFinalOutput, getDisplayItems, getOutputTail } from "./utils.js";
+import { getFinalOutput, getDisplayItems } from "./utils.js";
 
 type Theme = ExtensionContext["ui"]["theme"];
 
