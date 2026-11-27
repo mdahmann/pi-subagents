@@ -7,11 +7,14 @@
  * Requires pi packages to be importable. Skips gracefully if unavailable.
  */
 
-import { describe, it } from "node:test";
+import { describe, it, before, after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createTempDir, removeTempDir, tryImport } from "./helpers.ts";
+import { setTimeout as delay } from "node:timers/promises";
+import { ASYNC_DIR, DEFAULT_ARTIFACT_CONFIG, RESULTS_DIR } from "../types.ts";
+import { captureMockPiModels, createMockPi, createTempDir, makeAgent, removeTempDir, tryImport, type MockPi } from "./helpers.ts";
 
 // Top-level await
 const asyncMod = await tryImport<any>("./async-execution.ts");
@@ -74,5 +77,83 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		} finally {
 			removeTempDir(dir);
 		}
+	});
+});
+
+describe("async model CLI arguments", { skip: !available ? "pi packages not available" : undefined }, () => {
+	let mockPi: MockPi;
+
+	before(() => {
+		mockPi = createMockPi();
+		mockPi.install();
+		mockPi.onCall({ output: "Done" });
+	});
+	after(() => mockPi.uninstall());
+
+	async function captureRun(t: TestContext, run: (id: string, params: any) => void) {
+		assert.ok(isAsyncAvailable(), "async runner requires jiti");
+		const id = randomUUID();
+		const cwd = createTempDir();
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		t.after(() => {
+			removeTempDir(cwd);
+			removeTempDir(path.join(ASYNC_DIR, id));
+			fs.rmSync(resultPath, { force: true });
+		});
+		const models = captureMockPiModels(t, cwd);
+		run(id, {
+			ctx: {
+				pi: { events: { emit() {} } },
+				cwd,
+				currentSessionId: id,
+				parentModel: "mock/parent",
+			},
+			artifactConfig: { ...DEFAULT_ARTIFACT_CONFIG, enabled: false },
+			shareEnabled: false,
+		});
+
+		const deadline = Date.now() + 10_000;
+		while (Date.now() < deadline) {
+			try {
+				const result = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+				assert.equal(result.success, true, JSON.stringify(result));
+				return models();
+			} catch (e) {
+				if (!(e instanceof SyntaxError) && (e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+			}
+			await delay(25);
+		}
+		assert.fail("async runner did not write a result");
+	}
+
+	for (const [frontmatter, override, expected] of [
+		["mock/frontmatter", undefined, "mock/frontmatter"],
+		[undefined, undefined, "mock/parent"],
+		["mock/frontmatter", "mock/override", "mock/override"],
+	]) {
+		it(`uses ${expected} for a single agent`, async (t) => {
+			const models = await captureRun(t, (id, params) => asyncMod.executeAsyncSingle(id, {
+				...params,
+				agent: "echo",
+				task: "Task",
+				agentConfig: makeAgent("echo", { model: frontmatter }),
+				modelOverride: override,
+			}));
+			assert.deepEqual(models, [expected]);
+		});
+	}
+
+	it("prefers step, agent, then parent models for async chain spawns", async (t) => {
+		const models = await captureRun(t, (id, params) => asyncMod.executeAsyncChain(id, {
+			...params,
+			agents: [makeAgent("configured", { model: "mock/frontmatter" }), makeAgent("unconfigured")],
+			chain: [
+				{ agent: "configured", task: "First" },
+				{ agent: "unconfigured", task: "Second" },
+				{ agent: "configured", task: "Third", model: "mock/override" },
+				{ parallel: [{ agent: "configured", task: "Fourth" }] },
+			],
+		}));
+		assert.deepEqual(models, ["mock/frontmatter", "mock/parent", "mock/override", "mock/frontmatter"]);
 	});
 });

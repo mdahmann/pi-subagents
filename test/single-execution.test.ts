@@ -16,6 +16,7 @@ import * as path from "node:path";
 import type { MockPi } from "./helpers.ts";
 import {
 	createMockPi,
+	captureMockPiModels,
 	createTempDir,
 	removeTempDir,
 	makeAgentConfigs,
@@ -98,29 +99,43 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(output, "Got it");
 	});
 
-	it("uses agent model config", async () => {
+	it("uses agent model config before the parent model", async (t) => {
 		mockPi.onCall({ output: "Done" });
+		const models = captureMockPiModels(t, tempDir);
 		const agents = [makeAgent("echo", { model: "anthropic/claude-sonnet-4" })];
 
-		const result = await runSync(tempDir, agents, "echo", "Task", {});
+		const result = await runSync(tempDir, agents, "echo", "Task", { parentModel: "mock/parent" });
 
 		assert.equal(result.exitCode, 0);
+		assert.deepEqual(models(), ["anthropic/claude-sonnet-4"]);
 		// result.model is set from agent config via applyThinkingSuffix, then
 		// overwritten by the first message_end event only if result.model is unset.
 		// Since agent has model config, it stays as the configured value.
 		assert.equal(result.model, "anthropic/claude-sonnet-4");
 	});
 
-	it("model override from options takes precedence", async () => {
+	it("model override from options takes precedence", async (t) => {
 		mockPi.onCall({ output: "Done" });
+		const models = captureMockPiModels(t, tempDir);
 		const agents = [makeAgent("echo", { model: "anthropic/claude-sonnet-4" })];
 
 		const result = await runSync(tempDir, agents, "echo", "Task", {
 			modelOverride: "openai/gpt-4o",
+			parentModel: "mock/parent",
 		});
 
 		assert.equal(result.exitCode, 0);
 		assert.equal(result.model, "openai/gpt-4o");
+		assert.deepEqual(models(), ["openai/gpt-4o"]);
+	});
+
+	it("inherits the parent model when agent model config is absent", async (t) => {
+		mockPi.onCall({ output: "Done" });
+		const models = captureMockPiModels(t, tempDir);
+		const result = await runSync(tempDir, [makeAgent("echo")], "echo", "Task", { parentModel: "mock/parent" });
+
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(models(), ["mock/parent"]);
 	});
 
 	it("tracks usage from message events", async () => {

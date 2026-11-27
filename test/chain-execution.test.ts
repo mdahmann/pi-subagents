@@ -15,6 +15,7 @@ import * as path from "node:path";
 import type { MockPi } from "./helpers.ts";
 import {
 	createMockPi,
+	captureMockPiModels,
 	createTempDir,
 	removeTempDir,
 	makeAgent,
@@ -81,6 +82,25 @@ describe("chain execution — sequential", { skip: !available ? "pi packages not
 		assert.equal(result.details.results.length, 2);
 		assert.equal(result.details.results[0].agent, "analyst");
 		assert.equal(result.details.results[1].agent, "reporter");
+	});
+
+	it("prefers step, agent, then parent models for chain spawns", async (t) => {
+		mockPi.onCall({ output: "Done" });
+		const models = captureMockPiModels(t, tempDir);
+		const ctx = { ...makeMinimalCtx(tempDir), model: { provider: "mock", id: "parent" } };
+		const result = await executeChain(makeChainParams(
+			[
+				{ agent: "configured", task: "First" },
+				{ agent: "unconfigured", task: "Second" },
+				{ agent: "configured", task: "Third", model: "mock/override" },
+				{ parallel: [{ agent: "configured", task: "Fourth" }] },
+			],
+			[makeAgent("configured", { model: "mock/frontmatter" }), makeAgent("unconfigured")],
+			{ ctx },
+		));
+
+		assert.ok(!result.isError);
+		assert.deepEqual(models(), ["mock/frontmatter", "mock/parent", "mock/override", "mock/frontmatter"]);
 	});
 
 	it("passes {previous} between steps (step 2 receives step 1 output)", async () => {

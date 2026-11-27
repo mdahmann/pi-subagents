@@ -58,6 +58,8 @@ interactive: true            # (parsed but not enforced in v1)
 Your system prompt goes here (the markdown body after frontmatter).
 ```
 
+An explicit run or step model wins. Otherwise, the agent uses its frontmatter `model`, or inherits the parent Pi session's model if none is configured. This applies to both foreground and background runs.
+
 The `thinking` field sets a default extended thinking level for the agent. At runtime it's appended as a `:level` suffix to the model string (e.g., `claude-sonnet-4-5:high`). If the model already has a thinking suffix (from a chain-clarify override), the agent's default is not double-applied.
 
 **Extension sandboxing**

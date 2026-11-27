@@ -224,7 +224,7 @@ export interface RunSyncOptions {
 	share?: boolean;
 	/** Override the agent's default model (format: "provider/id" or just "id") */
 	modelOverride?: string;
-	/** Parent session model (provider/id format). Used as fallback when no explicit model override is provided. */
+	/** Parent session model (provider/id format), used when neither the run nor the agent specifies a model. */
 	parentModel?: string;
 	/** Skills to inject (overrides agent default if provided) */
 	skills?: string[];
